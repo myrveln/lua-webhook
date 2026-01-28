@@ -1,0 +1,580 @@
+# lua-webhook
+
+A high-performance, RESTful webhook storage service built with OpenResty/Nginx and Lua, backed by Valkey. Store, retrieve, and manage webhook payloads with advanced features like batch operations, search, and expiry notifications.
+
+## Features
+
+- 🚀 **RESTful API** - Clean, intuitive REST endpoints
+- 📦 **Batch Operations** - Create or delete multiple webhooks in one request
+- 🔍 **Full-Text Search** - Search across all webhook payloads
+- 📊 **Statistics** - Real-time storage and usage metrics
+- ⏰ **TTL Management** - Automatic expiration with configurable time-to-live
+- 🔔 **Callback URLs** - Register callbacks for expiry notifications
+- 🏷️ **Categories** - Organize webhooks into categories
+- 🎯 **Query Filtering** - Filter webhooks by timestamp
+- 📝 **PATCH Support** - Update TTL and metadata without full replacement
+- 🛡️ **Error Codes** - Comprehensive error handling with specific error codes
+- 💾 **Storage Limits** - Configurable storage limits with quota management
+- 📈 **Response Headers** - Storage metrics in HTTP headers
+- 🔄 **Webhook Replay** - Replay webhooks to recreate them with new keys
+- 📤 **Export/Import** - Backup and restore webhooks with full data preservation
+- 📡 **WebSocket Events** - Real-time notifications via Valkey pub/sub
+- 📊 **Prometheus Metrics** - Built-in metrics endpoint for monitoring
+
+## Requirements
+
+- [OpenResty](https://openresty.org/) (or Nginx with Lua support)
+- Valkey 7.2+ (or Redis 3.0+)
+- `lua-resty-redis` library (included with OpenResty)
+- `lua-cjson` library (included with OpenResty)
+
+## Installation
+
+### Clone and Configure
+
+```bash
+git clone https://github.com/myrveln/lua-webhook.git
+cd lua-webhook
+
+# Edit nginx-example.conf to update the webhook.lua path
+
+# Include it in your existing server block in nginx.conf:
+#   server {
+#       listen 80;
+#       server_name yourdomain.com;
+#
+#       include /full/path/to/lua-webhook/nginx-example.conf;
+#
+#       # ... rest of your server config
+#   }
+
+# Test the configuration
+sudo openresty -t
+
+# Reload OpenResty
+sudo openresty -s reload
+```
+
+### Configuration
+
+Edit `webhook.lua` to customize settings:
+
+```lua
+local PREFIX = "webhook:"                     -- Valkey key prefix
+local DEFAULT_CATEGORY = "default"            -- Default category name
+local DEFAULT_TTL = 259200                    -- 3 days in seconds
+local MAX_BODY_SIZE = 1024 * 1024             -- 1 MB max payload
+local TOTAL_PAYLOAD_LIMIT = 50 * 1024 * 1024  -- 50 MB total storage
+local REDIS_HOST = "127.0.0.1"
+local REDIS_PORT = 6379
+```
+
+## API Documentation
+
+### Base URL
+```
+https://your-domain.com/webhook
+```
+
+### Endpoints
+
+#### Create Webhook
+```http
+POST /webhook/:category
+POST /webhook (uses default category)
+```
+
+**Request Body:**
+```json
+{
+  "your": "data",
+  "any": "json payload",
+  "ttl": 3600,
+  "callback_url": "https://example.com/notify"
+}
+```
+
+**Response:**
+```json
+{
+  "status": "stored",
+  "key": "orders:1768418049:abc123...",
+  "created_at": "2026-01-14T19:14:09",
+  "category": "orders",
+  "url": "https://your-domain.com/webhook/orders/orders:1768418049:abc123...",
+  "ttl": 3600,
+  "callback_registered": true
+}
+```
+
+#### Get Webhook
+```http
+GET /webhook/:category/:key
+```
+
+**Response:**
+```json
+{
+  "key": "orders:1768418049:abc123...",
+  "ttl": 3540,
+  "category": "orders",
+  "created_at": "2026-01-14T19:14:09",
+  "value": {
+    "your": "data"
+  },
+  "callback_url": "https://example.com/notify"
+}
+```
+
+#### List Webhooks in Category
+```http
+GET /webhook/:category
+GET /webhook/:category?since=1768418000
+```
+
+**Response:**
+```json
+{
+  "keys": [
+    {
+      "key": "orders:1768418049:abc123...",
+      "ttl": 3540,
+      "created_at": "2026-01-14T19:14:09",
+      "category": "orders",
+      "payload": {"your": "data"}
+    }
+  ],
+  "count": 1,
+  "category": "orders"
+}
+```
+
+**Headers:**
+- `X-Total-Count`: Number of webhooks returned
+- `X-Storage-Used`: Current storage usage in bytes
+- `X-Storage-Limit`: Maximum storage limit in bytes
+
+#### Update Webhook (TTL or Callback)
+```http
+PATCH /webhook/:category/:key
+```
+
+**Request Body:**
+```json
+{
+  "ttl": 7200,
+  "callback_url": "https://example.com/new-callback"
+}
+```
+
+#### Delete Webhook
+```http
+DELETE /webhook/:category/:key
+```
+
+**Response:**
+```json
+{
+  "status": "deleted",
+  "key": "orders:1768418049:abc123..."
+}
+```
+
+#### Batch Create
+```http
+POST /webhook/:category/_batch
+```
+
+**Request Body:**
+```json
+{
+  "items": [
+    {"data": "item1"},
+    {"data": "item2"},
+    {"data": "item3"}
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "success": [
+    {"index": 1, "key": "...", "created_at": "..."},
+    {"index": 2, "key": "...", "created_at": "..."}
+  ],
+  "failed": [
+    {"index": 3, "error": "Storage limit reached", "error_code": "STORAGE_LIMIT_EXCEEDED"}
+  ],
+  "total_created": 2,
+  "total_failed": 1
+}
+```
+
+#### Batch Delete
+```http
+DELETE /webhook/:category/_batch
+```
+
+**Request Body:**
+```json
+{
+  "keys": ["key1", "key2", "key3"]
+}
+```
+
+#### Search Webhooks
+```http
+GET /webhook/_search?q=searchterm
+```
+
+**Response:**
+```json
+{
+  "query": "searchterm",
+  "count": 2,
+  "results": [
+    {
+      "key": "...",
+      "ttl": 3540,
+      "created_at": "...",
+      "category": "orders",
+      "payload": {"matching": "data"}
+    }
+  ]
+}
+```
+
+#### Get Statistics
+```http
+GET /webhook/_stats
+```
+
+**Response:**
+```json
+{
+  "total_webhooks": 42,
+  "total_size_bytes": 1048576,
+  "storage_limit_bytes": 52428800,
+  "storage_used_percent": 2,
+  "categories": {
+    "orders": 20,
+    "products": 15,
+    "default": 7
+  },
+  "oldest_webhook": "orders:1768400000:xyz...",
+  "newest_webhook": "orders:1768418049:abc...",
+  "oldest_timestamp": "2026-01-14T14:00:00",
+  "newest_timestamp": "2026-01-14T19:14:09"
+}
+```
+
+#### Replay Webhook
+```http
+POST /webhook/:category/:key/_replay
+```
+
+**Request Body (optional):**
+```json
+{
+  "category": "replays",
+  "ttl": 7200
+}
+```
+
+**Response:**
+```json
+{
+  "status": "replayed",
+  "new_key": "replays:1768418500:replay:def456...",
+  "original_key": "orders:1768418049:abc123...",
+  "created_at": "2026-01-14T19:30:00",
+  "category": "replays",
+  "ttl": 7200,
+  "url": "https://your-domain.com/webhook/replays/replays:1768418500:replay:def456..."
+}
+```
+
+#### Export Webhooks
+```http
+GET /webhook/_export           # Export all webhooks
+GET /webhook/:category/_export  # Export specific category
+```
+
+**Response:**
+```json
+{
+  "version": "1.0",
+  "exported_at": "2026-01-14T19:30:00",
+  "category": "orders",
+  "total_exported": 5,
+  "webhooks": [
+    {
+      "key": "orders:1768418049:abc123...",
+      "ttl": 3540,
+      "created_at": "2026-01-14T19:14:09",
+      "category": "orders",
+      "payload": {"order_id": 12345},
+      "callback_url": "https://example.com/notify"
+    }
+  ]
+}
+```
+
+**Headers:**
+- `Content-Disposition`: Suggests filename for download
+
+#### Import Webhooks
+```http
+POST /webhook/_import
+```
+
+**Request Body:**
+```json
+{
+  "version": "1.0",
+  "exported_at": "2026-01-14T19:30:00",
+  "category": "all",
+  "webhooks": [...]
+}
+```
+
+**Response:**
+```json
+{
+  "imported": [
+    {"index": 1, "key": "...", "category": "orders"},
+    {"index": 2, "key": "...", "category": "orders"}
+  ],
+  "failed": [],
+  "total_imported": 2,
+  "total_failed": 0
+}
+```
+
+#### Prometheus Metrics
+```http
+GET /webhook/_metrics
+```
+
+**Response** (Prometheus format):
+```
+# HELP webhook_requests_total Total number of webhook requests
+# TYPE webhook_requests_total counter
+webhook_requests_total{method="POST"} 150
+webhook_requests_total{method="GET"} 320
+webhook_requests_total{method="DELETE"} 45
+webhook_requests_total{method="PATCH"} 12
+
+# HELP webhook_created_total Total number of webhooks created
+# TYPE webhook_created_total counter
+webhook_created_total 150
+
+# HELP webhook_storage_bytes Current storage usage in bytes
+# TYPE webhook_storage_bytes gauge
+webhook_storage_bytes 1048576
+
+# HELP webhook_count Current number of webhooks
+# TYPE webhook_count gauge
+webhook_count 42
+```
+
+**Headers:**
+- `Content-Type`: `text/plain; version=0.0.4`
+
+### Error Codes
+
+All errors include an `error_code` field for programmatic handling:
+
+- `NO_BODY` - Request body is missing
+- `INVALID_JSON` - Request body is not valid JSON
+- `KEY_NOT_FOUND` - Requested webhook key doesn't exist
+- `MISSING_KEY` - Key required but not provided in path
+- `MISSING_QUERY` - Search query parameter missing
+- `STORAGE_LIMIT_EXCEEDED` - Storage quota reached
+- `PAYLOAD_TOO_LARGE` - Single payload exceeds size limit
+- `INVALID_BATCH_FORMAT` - Batch request format is incorrect
+- `INVALID_ITEM_TYPE` - Batch item is not a JSON object
+- `METHOD_NOT_ALLOWED` - HTTP method not supported for endpoint
+- `REDIS_ERROR` - Valkey operation failed
+
+## Testing
+
+The project includes a comprehensive Python test suite using pytest. See [tests/README_TESTING.md](tests/README_TESTING.md) for complete testing documentation.
+
+```bash
+cd tests
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pytest test_webhook.py -v
+```
+
+## Usage Examples
+
+### Store a webhook
+```bash
+curl -X POST https://your-domain.com/webhook/orders \
+  -H "Content-Type: application/json" \
+  -d '{"order_id": 12345, "total": 99.99, "ttl": 3600}'
+```
+
+### Retrieve a webhook
+```bash
+curl https://your-domain.com/webhook/orders/orders:1768418049:abc123...
+```
+
+### Search for webhooks
+```bash
+curl "https://your-domain.com/webhook/_search?q=12345"
+```
+
+### Get statistics
+```bash
+curl https://your-domain.com/webhook/_stats
+```
+
+### Batch create
+```bash
+curl -X POST https://your-domain.com/webhook/products/_batch \
+  -H "Content-Type: application/json" \
+  -d '{"items": [{"name": "Product 1"}, {"name": "Product 2"}]}'
+```
+
+### Replay a webhook
+```bash
+curl -X POST https://your-domain.com/webhook/orders/orders:1768418049:abc123/_replay \
+  -H "Content-Type: application/json" \
+  -d '{"category": "replays", "ttl": 7200}'
+```
+
+### Export webhooks
+```bash
+# Export all webhooks
+curl https://your-domain.com/webhook/_export > backup.json
+
+# Export specific category
+curl https://your-domain.com/webhook/orders/_export > orders_backup.json
+```
+
+### Import webhooks
+```bash
+curl -X POST https://your-domain.com/webhook/_import \
+  -H "Content-Type: application/json" \
+  -d @backup.json
+```
+
+### Get Prometheus metrics
+```bash
+curl https://your-domain.com/webhook/_metrics
+```
+
+### Subscribe to WebSocket events
+```bash
+# Using Valkey CLI (compatible with Redis CLI)
+valkey-cli SUBSCRIBE webhook:events
+# or
+redis-cli SUBSCRIBE webhook:events
+
+# Or integrate in your application (see integration examples below)
+```
+
+## Performance
+
+- **Valkey-backed**: Extremely fast read/write operations
+- **Automatic expiration**: Uses Valkey TTL for efficient cleanup
+- **Lazy recalculation**: Storage metrics calculated periodically, not on every request
+- **Batch operations**: Process multiple webhooks in a single request
+- **Minimal overhead**: Direct Lua execution in Nginx worker processes
+- **Event-driven**: WebSocket events via Valkey pub/sub for real-time updates
+- **Metrics collection**: Track usage patterns with minimal performance impact
+
+## WebSocket Event Integration
+
+Webhook events are published to Valkey pub/sub channel `webhook:events` and can be consumed by your application to provide real-time notifications.
+
+### Event Types
+
+- `webhook.created` - When a webhook is created
+- `webhook.updated` - When a webhook is updated via PATCH
+- `webhook.deleted` - When a webhook is deleted
+- `webhook.replayed` - When a webhook is replayed
+
+### Integration Examples
+
+**Node.js with Socket.IO:**
+```javascript
+const redis = require('redis');
+const io = require('socket.io')(server);
+
+const subscriber = redis.createClient();
+subscriber.subscribe('webhook:events');
+
+subscriber.on('message', (channel, message) => {
+  const event = JSON.parse(message);
+  io.emit('webhook-event', event);
+});
+```
+
+**Python:**
+```python
+import redis
+import json
+
+r = redis.Redis()
+pubsub = r.pubsub()
+pubsub.subscribe('webhook:events')
+
+for message in pubsub.listen():
+    if message['type'] == 'message':
+        event = json.loads(message['data'])
+        print(f"Event: {event['type']}", event['data'])
+```
+
+## Monitoring with Prometheus
+
+The `/webhook/_metrics` endpoint provides metrics in Prometheus format. Add to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'webhook'
+    static_configs:
+      - targets: ['your-domain.com']
+    metrics_path: '/webhook/_metrics'
+    scrape_interval: 30s
+```
+
+### Available Metrics
+
+- `webhook_requests_total` - Total requests by HTTP method (counter)
+- `webhook_created_total` - Total webhooks created (counter)
+- `webhook_deleted_total` - Total webhooks deleted (counter)
+- `webhook_storage_bytes` - Current storage usage (gauge)
+- `webhook_storage_limit_bytes` - Storage limit (gauge)
+- `webhook_count` - Current number of webhooks (gauge)
+- `webhook_errors_total` - Total errors encountered (counter)
+
+## Security Considerations
+
+⚠️ **Important**: This webhook service does not include built-in authentication. Before deploying to production:
+
+1. Implement authentication (API keys, OAuth, etc.)
+2. Add rate limiting
+3. Use HTTPS/TLS encryption
+4. Restrict access via firewall rules
+5. Monitor for abuse
+6. Consider using nginx's built-in security modules
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built with [OpenResty](https://openresty.org/)
+- Uses [Valkey](https://valkey.io/) for storage
+- Inspired by modern webhook services
+
+---
+
+Made with ❤️ by myrveln

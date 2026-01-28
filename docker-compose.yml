@@ -1,0 +1,26 @@
+services:
+  valkey:
+    image: valkey/valkey:7.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  openresty:
+    build: .
+    ports:
+      - "8080:80"
+    environment:
+      REDIS_HOST: valkey
+      REDIS_PORT: "6379"
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/webhook/_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

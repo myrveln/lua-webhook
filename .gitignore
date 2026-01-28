@@ -1,0 +1,61 @@
+# Logs
+*.log
+logs/
+*.log.*
+
+# OpenResty/Nginx
+/logs/
+/client_body_temp/
+/proxy_temp/
+/fastcgi_temp/
+/uwsgi_temp/
+/scgi_temp/
+
+# Redis
+dump.rdb
+*.rdb
+*.aof
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Testing
+test-results/
+coverage/
+*.test
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# Backups
+*.bak
+*.backup
+*~
+
+# Local configuration
+nginx-local.conf
+webhook-local.lua
+local-config.lua
