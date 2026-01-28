@@ -1,0 +1,66 @@
+name: Webhook Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start services
+      run: docker compose up -d --build
+
+    - name: Wait for OpenResty
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS http://localhost:8080/webhook/_stats >/dev/null; then
+            exit 0
+          fi
+          sleep 1
+        done
+        docker compose ps
+        docker compose logs
+        exit 1
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        cd tests
+        pip install -r requirements.txt
+
+    - name: Run tests
+      env:
+        BASE_URL: http://localhost:8080/webhook
+      run: |
+        cd tests
+        pytest test_webhook.py -v --cov=. --cov-report=xml
+
+    - name: Upload coverage artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-xml
+        path: tests/coverage.xml
+        if-no-files-found: warn
+
+    - name: Show logs on failure
+      if: failure()
+      run: docker compose logs
+
+    - name: Stop services
+      if: always()
+      run: docker compose down
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v4
+      with:
+        files: tests/coverage.xml
+        # For public repos, tokenless upload can work but is rate-limited.
+        # Add CODECOV_TOKEN as a GitHub Actions secret to avoid 429s.
+        # token: ${{ secrets.CODECOV_TOKEN }}
