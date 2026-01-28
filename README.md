@@ -1,5 +1,7 @@
 # lua-webhook
 
+[![codecov](https://codecov.io/gh/myrveln/lua-webhook/branch/master/graph/badge.svg)](https://codecov.io/gh/myrveln/lua-webhook)
+
 A high-performance, RESTful webhook storage service built with OpenResty/Nginx and Lua, backed by Valkey. Store, retrieve, and manage webhook payloads with advanced features like batch operations, search, and expiry notifications.
 
 ## Features

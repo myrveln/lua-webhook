@@ -41,6 +41,34 @@ jobs:
         cd tests
         pytest test_webhook.py -v --cov=. --cov-report=xml
 
+    - name: Coverage summary
+      if: always()
+      run: |
+        python - <<'PY'
+        import os
+        import pathlib
+        import xml.etree.ElementTree as ET
+
+        coverage_xml = pathlib.Path('tests/coverage.xml')
+        if not coverage_xml.exists():
+          print('No tests/coverage.xml found; skipping summary.')
+          raise SystemExit(0)
+
+        root = ET.parse(coverage_xml).getroot()
+        line_rate = float(root.attrib.get('line-rate', '0'))
+        percent = line_rate * 100
+
+        repo = os.environ.get('GITHUB_REPOSITORY', 'myrveln/lua-webhook')
+        codecov_url = f'https://codecov.io/gh/{repo}'
+        summary_path = pathlib.Path(os.environ['GITHUB_STEP_SUMMARY'])
+        summary_path.write_text(
+          '## Coverage\n\n'
+          f'- Line coverage: **{percent:.2f}%**\n'
+          f'- Codecov: {codecov_url}\n'
+        )
+        print(f'Line coverage: {percent:.2f}%')
+        PY
+
     - name: Upload coverage artifact
       if: always()
       uses: actions/upload-artifact@v4
