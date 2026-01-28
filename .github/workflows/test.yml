@@ -58,9 +58,7 @@ jobs:
       run: docker compose down
 
     - name: Upload coverage
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
       uses: codecov/codecov-action@v4
       with:
         files: tests/coverage.xml
-        # For public repos, tokenless upload can work but is rate-limited.
-        # Add CODECOV_TOKEN as a GitHub Actions secret to avoid 429s.
-        # token: ${{ secrets.CODECOV_TOKEN }}
