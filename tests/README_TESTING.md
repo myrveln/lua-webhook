@@ -70,6 +70,72 @@ BASE_URL=http://localhost:8080/webhook pytest test_webhook.py -v
 deactivate
 ```
 
+Note: `test_webhook.py` automatically includes `X-API-Key` on all requests if you set `WEBHOOK_TEST_API_KEY`. This allows running the same functional suite against an auth-enabled deployment.
+
+## Run Tests With Authentication Enabled
+
+The service supports optional API key authentication (see the repo README). The test suite includes additional authentication tests in `test_auth.py`.
+
+### 1) Start Docker Compose with auth enabled
+
+From the repository root:
+
+```bash
+# Require an API key for all endpoints except _stats (so healthchecks still work)
+export WEBHOOK_API_KEYS="test-api-key"
+export WEBHOOK_AUTH_EXEMPT="_stats"
+
+docker compose up -d --build
+```
+
+Quick checks:
+
+```bash
+# _stats should be reachable without a key
+curl -fsS http://localhost:8080/webhook/_stats
+
+# Other endpoints should require a key
+curl -i http://localhost:8080/webhook
+curl -i -H "X-API-Key: definitely-wrong" http://localhost:8080/webhook
+curl -i -H "X-API-Key: test-api-key" http://localhost:8080/webhook
+```
+
+### 2) Run the auth tests
+
+From `tests/` with your venv active:
+
+```bash
+cd tests
+
+BASE_URL=http://localhost:8080/webhook \
+WEBHOOK_TEST_API_KEY="test-api-key" \
+pytest test_auth.py -v
+```
+
+### 3) Run both suites locally (recommended flow)
+
+Because enabling auth will make the existing no-auth tests fail (they intentionally do not send API keys), run them in two passes:
+
+```bash
+# Pass 1: run the original suite with auth disabled
+unset WEBHOOK_API_KEYS
+unset WEBHOOK_AUTH_EXEMPT
+
+docker compose down
+docker compose up -d --build
+
+cd tests
+BASE_URL=http://localhost:8080/webhook pytest test_webhook.py -v
+
+# Pass 2: restart with auth enabled and run auth tests
+cd ..
+docker compose down
+WEBHOOK_API_KEYS="test-api-key" WEBHOOK_AUTH_EXEMPT="_stats" docker compose up -d --build
+
+cd tests
+BASE_URL=http://localhost:8080/webhook WEBHOOK_TEST_API_KEY="test-api-key" pytest test_webhook.py test_auth.py -v
+```
+
 ### Notes
 
 - `BASE_URL` defaults to the local Docker Compose environment (`http://localhost:8080/webhook`).
