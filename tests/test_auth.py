@@ -51,7 +51,7 @@ class TestWebhookAuthentication:
 
     def test_valid_api_key_allows_crud(self):
         if not API_KEY:
-            pytest.skip("WEBHOOK_TEST_API_KEY not set")
+            pytest.skip("WEBHOOK_TEST_API_KEY not set")  # pragma: no cover
 
         headers = _headers_x_api_key(API_KEY)
 
@@ -78,7 +78,7 @@ class TestWebhookAuthentication:
 
     def test_metrics_requires_auth_and_exports_auth_counters(self):
         if not API_KEY:
-            pytest.skip("WEBHOOK_TEST_API_KEY not set")
+            pytest.skip("WEBHOOK_TEST_API_KEY not set")  # pragma: no cover
 
         # Generate a couple auth failures
         requests.get(BASE_URL)
