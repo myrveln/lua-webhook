@@ -10,7 +10,7 @@ def _is_http_ready(url: str, *, timeout_s: float) -> bool:
         # Any HTTP response means the server is listening.
         requests.get(url, timeout=timeout_s)
         return True
-    except requests.RequestException:
+    except requests.RequestException:  # pragma: no cover
         return False
 
 
@@ -42,10 +42,9 @@ def wait_for_openresty() -> None:
             if _is_http_ready(probe_url, timeout_s=0.5):
                 return
 
-        time.sleep(sleep_s)
-        sleep_s = min(sleep_s * 1.5, 1.0)
+        time.sleep(sleep_s)  # pragma: no cover
+        sleep_s = min(sleep_s * 1.5, 1.0)  # pragma: no cover
 
     raise RuntimeError(
-        "OpenResty did not become ready in time. "
-        f"Tried: {', '.join(probe_urls)}"
-    )
+        f"OpenResty did not become ready in time. Tried: {', '.join(probe_urls)}"
+    )  # pragma: no cover

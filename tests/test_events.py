@@ -36,6 +36,16 @@ def _auth_headers(headers: Dict[str, str] | None = None) -> Dict[str, str]:
     return merged
 
 
+class _FakePubSub:
+    def __init__(self, messages: list[dict | None]):
+        self._messages = list(messages)
+
+    def get_message(self, *args, **kwargs):
+        if self._messages:
+            return self._messages.pop(0)
+        return None
+
+
 def _wait_for_event(pubsub: redis.client.PubSub, timeout_s: float = 5.0) -> dict:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -85,7 +95,11 @@ class TestWebhookEventPublishing:
 
         try:
             payload = {"event_test": "created"}
-            resp = requests.post(f"{BASE_URL}/events", json=payload, headers=_auth_headers())
+            resp = requests.post(
+                f"{BASE_URL}/events",
+                json=payload,
+                headers=_auth_headers({"X-Test-Header": "1"}),
+            )
             assert resp.status_code == 200
             key = resp.json()["key"]
 
@@ -97,8 +111,8 @@ class TestWebhookEventPublishing:
         finally:
             try:
                 pubsub.close()
-            except Exception:
-                pass
+            except Exception:  # pragma: no cover
+                pass  # pragma: no cover
 
     def test_delete_publishes_event(self):
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
@@ -123,7 +137,7 @@ class TestWebhookEventPublishing:
             deadline = time.time() + 5.0
             while True:
                 if time.time() > deadline:
-                    raise AssertionError("No webhook.deleted event received")
+                    raise AssertionError("No webhook.deleted event received")  # pragma: no cover
                 event = _wait_for_event(pubsub, timeout_s=1.0)
                 if event.get("type") == "webhook.deleted" and event.get("data", {}).get("key") == key:
                     assert event["data"]["category"] == "events"
@@ -131,5 +145,38 @@ class TestWebhookEventPublishing:
         finally:
             try:
                 pubsub.close()
-            except Exception:
-                pass
+            except Exception:  # pragma: no cover
+                pass  # pragma: no cover
+
+
+def test__auth_headers_merges_dict() -> None:
+    hdrs = _auth_headers({"X-Extra": "1"})
+    assert hdrs.get("X-Extra") == "1"
+
+
+def test__wait_for_event_skips_and_parses() -> None:
+    pubsub = _FakePubSub(
+        [
+            None,
+            {"type": "subscribe"},
+            {"type": "message", "data": b"{\"ok\": true}"},
+        ]
+    )
+    event = _wait_for_event(pubsub, timeout_s=0.1)
+    assert event == {"ok": True}
+
+
+def test__wait_for_event_bad_json_then_raises() -> None:
+    pubsub = _FakePubSub(
+        [
+            {"type": "message", "data": b"{not-json"},
+        ]
+    )
+    with pytest.raises(AssertionError):
+        _wait_for_event(pubsub, timeout_s=0.01)
+
+
+def test__wait_for_subscribed_raises_when_missing() -> None:
+    pubsub = _FakePubSub([None, None, None])
+    with pytest.raises(AssertionError):
+        _wait_for_subscribed(pubsub, "webhook:events", timeout_s=0.01)

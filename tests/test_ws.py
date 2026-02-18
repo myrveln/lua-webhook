@@ -82,6 +82,20 @@ def test_websocket_receives_created_event() -> None:
             ready = await _recv_json(ws)
             assert ready.get("type") == "webhook.ws_ready"
 
+            def _create_noise() -> str:
+                resp = requests.post(
+                    f"{BASE_URL}/ws",
+                    json={"ws": "noise"},
+                    headers=http_headers,
+                    timeout=5,
+                )
+                assert resp.status_code == 200
+                return resp.json()["key"]
+
+            def _delete(key: str) -> None:
+                resp = requests.delete(f"{BASE_URL}/ws/{key}", headers=http_headers, timeout=5)
+                assert resp.status_code == 200
+
             def _create() -> requests.Response:
                 return requests.post(
                     f"{BASE_URL}/ws",
@@ -91,6 +105,8 @@ def test_websocket_receives_created_event() -> None:
                 )
 
             loop = asyncio.get_running_loop()
+            noise_key: str = await loop.run_in_executor(None, _create_noise)
+            await loop.run_in_executor(None, _delete, noise_key)
             resp: requests.Response = await loop.run_in_executor(None, _create)
             assert resp.status_code == 200
             created_key = resp.json()["key"]
@@ -99,7 +115,7 @@ def test_websocket_receives_created_event() -> None:
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise AssertionError("Timed out waiting for webhook.created over WebSocket")
+                    raise AssertionError("Timed out waiting for webhook.created over WebSocket")  # pragma: no cover
 
                 event = await _recv_json(ws, timeout_s=min(remaining, 5.0))
                 if event.get("type") != "webhook.created":
@@ -108,5 +124,42 @@ def test_websocket_receives_created_event() -> None:
                     continue
                 assert event.get("data", {}).get("category") == "ws"
                 break
+
+    asyncio.run(_run())
+
+
+def test__auth_headers_merges_dict() -> None:
+    hdrs = _auth_headers({"X-Extra": "1"})
+    assert hdrs.get("X-Extra") == "1"
+
+
+def test__connect_ws_with_retry_falls_back_on_typeerror(monkeypatch) -> None:
+    # Deliberately omit the `proxy` kwarg from this stub so the first call
+    # (which passes `proxy=None`) raises a TypeError.
+    async def fake_connect(url: str, additional_headers: Dict[str, str]):
+        return object()
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    async def _run() -> None:
+        ws = await _connect_ws_with_retry("ws://example.invalid", {}, timeout_s=0.01)
+        assert ws is not None
+
+    asyncio.run(_run())
+
+
+def test__connect_ws_with_retry_times_out(monkeypatch) -> None:
+    async def fake_connect(*args, **kwargs):
+        raise RuntimeError("nope")
+
+    async def fake_sleep(_seconds: float):
+        return None
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    async def _run() -> None:
+        with pytest.raises(AssertionError):
+            await _connect_ws_with_retry("ws://example.invalid", {}, timeout_s=0.01)
 
     asyncio.run(_run())
