@@ -123,6 +123,90 @@ local function increment_metric(red, metric_name, value)
     red:incrby(metric_key, value)
 end
 
+local function mget_chunked(red, keys, chunk_size)
+    if not keys or #keys == 0 then
+        return {}
+    end
+    chunk_size = chunk_size or 500
+
+    local out = {}
+    local i = 1
+    while i <= #keys do
+        local j = math.min(i + chunk_size - 1, #keys)
+        local chunk = {}
+        for k = i, j do
+            chunk[#chunk + 1] = keys[k]
+        end
+
+        local vals, err = red:mget(unpack(chunk))
+        if not vals then
+            return nil, err
+        end
+
+        for _, v in ipairs(vals) do
+            out[#out + 1] = v
+        end
+        i = j + 1
+    end
+
+    return out
+end
+
+local function scan_keys(red, pattern, count)
+    count = count or 1000
+    local cursor = "0"
+    local out = {}
+
+    while true do
+        local res, err = red:scan(cursor, "MATCH", pattern, "COUNT", count)
+        if not res then
+            return nil, err
+        end
+
+        cursor = res[1]
+        local batch = res[2]
+        if batch and type(batch) == "table" then
+            for _, k in ipairs(batch) do
+                out[#out + 1] = k
+            end
+        end
+
+        if cursor == "0" or cursor == 0 then
+            break
+        end
+    end
+
+    return out
+end
+
+local function ttl_pipeline_chunked(red, keys, chunk_size)
+    if not keys or #keys == 0 then
+        return {}
+    end
+    chunk_size = chunk_size or 500
+
+    local out = {}
+    local i = 1
+    while i <= #keys do
+        local j = math.min(i + chunk_size - 1, #keys)
+        red:init_pipeline()
+        for k = i, j do
+            red:ttl(keys[k])
+        end
+
+        local res, err = red:commit_pipeline()
+        if not res then
+            return nil, err
+        end
+        for _, v in ipairs(res) do
+            out[#out + 1] = v
+        end
+        i = j + 1
+    end
+
+    return out
+end
+
 local function send_json(status, tbl, headers)
     -- Track errors centrally for all JSON responses with HTTP status >= 400.
     -- This keeps `webhook_errors_total` consistent across endpoints.
@@ -178,14 +262,17 @@ local function lazy_recalc_total_size(red)
         return get_total_size(red)
     end
 
-    local keys = red:keys(PREFIX .. "*")
+    local keys = scan_keys(red, PREFIX .. "*")
     local sum = 0
     if keys and #keys > 0 then
-        local vals, err = red:mget(unpack(keys))
+        local vals, err = mget_chunked(red, keys)
         if vals then
             for i, val in ipairs(vals) do
                 local key_name = keys[i]
-                if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY then
+                if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
+                    and not string.match(key_name, "^" .. CALLBACK_PREFIX)
+                    and not string.match(key_name, "^" .. METRICS_PREFIX)
+                    and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
                     if val and val ~= ngx.null then
                         local ok, d = pcall(cjson.decode, val)
                         if ok and type(d) == "table" and d.size then
@@ -205,7 +292,7 @@ end
 
 local function get_stats(red)
     local total_size = lazy_recalc_total_size(red)
-    local keys = red:keys(PREFIX .. "*")
+    local keys = scan_keys(red, PREFIX .. "*")
 
     local count = 0
     local categories = {}
@@ -216,7 +303,10 @@ local function get_stats(red)
 
     if keys and #keys > 0 then
         for _, key_name in ipairs(keys) do
-            if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY and not string.match(key_name, "^" .. CALLBACK_PREFIX) then
+            if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
+                and not string.match(key_name, "^" .. CALLBACK_PREFIX)
+                and not string.match(key_name, "^" .. METRICS_PREFIX)
+                and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
                 count = count + 1
 
                 -- Extract category from key
@@ -256,21 +346,24 @@ local function get_stats(red)
 end
 
 local function search_webhooks(red, query)
-    local keys = red:keys(PREFIX .. "*")
+    local keys = scan_keys(red, PREFIX .. "*")
     local results = {}
 
     if not keys or #keys == 0 then
         return results
     end
 
-    local vals, err = red:mget(unpack(keys))
+    local vals, err = mget_chunked(red, keys)
     if not vals then
         return results
     end
 
     for i, val in ipairs(vals) do
         local key_name = keys[i]
-        if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY and not string.match(key_name, "^" .. CALLBACK_PREFIX) then
+        if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
+            and not string.match(key_name, "^" .. CALLBACK_PREFIX)
+            and not string.match(key_name, "^" .. METRICS_PREFIX)
+            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
             if val and val ~= ngx.null then
                 local ok, decoded = pcall(cjson.decode, val)
                 if ok and type(decoded) == "table" then
@@ -295,14 +388,17 @@ end
 
 local function get_prometheus_metrics(red)
     local metrics = {}
-    local metric_keys = red:keys(METRICS_PREFIX .. "*")
+    local metric_keys = scan_keys(red, METRICS_PREFIX .. "*")
 
     if metric_keys and #metric_keys > 0 then
-        for _, key in ipairs(metric_keys) do
-            local metric_name = string.gsub(key, "^" .. METRICS_PREFIX, "")
-            local value = red:get(key)
-            if value and value ~= ngx.null then
-                metrics[metric_name] = tonumber(value) or 0
+        local values, err = mget_chunked(red, metric_keys)
+        if values then
+            for i, key in ipairs(metric_keys) do
+                local metric_name = string.gsub(key, "^" .. METRICS_PREFIX, "")
+                local value = values[i]
+                if value and value ~= ngx.null then
+                    metrics[metric_name] = tonumber(value) or 0
+                end
             end
         end
     end
@@ -389,7 +485,7 @@ end
 
 local function export_webhooks(red, category_filter)
     local pattern = category_filter and (PREFIX .. category_filter .. ":*") or (PREFIX .. "*")
-    local keys = red:keys(pattern)
+    local keys = scan_keys(red, pattern)
     local export_data = {
         version = "1.0",
         exported_at = iso8601_timestamp(),
@@ -401,8 +497,11 @@ local function export_webhooks(red, category_filter)
         return export_data
     end
 
-    local vals = red:mget(unpack(keys))
+    local vals = mget_chunked(red, keys)
     if vals then
+        local callback_keys = {}
+        local callback_index = {}
+
         for i, val in ipairs(vals) do
             local key_name = keys[i]
             if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
@@ -416,12 +515,9 @@ local function export_webhooks(red, category_filter)
                         local webhook_key = string.gsub(key_name, "^" .. PREFIX, "")
                         local ttl = red:ttl(key_name) or -1
 
-                        -- Check for callback URL
                         local callback_key = CALLBACK_PREFIX .. webhook_key
-                        local callback_url = red:get(callback_key)
-                        if callback_url == ngx.null then
-                            callback_url = nil
-                        end
+                        callback_index[webhook_key] = #callback_keys + 1
+                        callback_keys[#callback_keys + 1] = callback_key
 
                         table.insert(export_data.webhooks, {
                             key = webhook_key,
@@ -429,8 +525,23 @@ local function export_webhooks(red, category_filter)
                             created_at = decoded.created_at,
                             category = decoded.category,
                             payload = decoded.payload,
-                            callback_url = callback_url
+                            callback_url = nil
                         })
+                    end
+                end
+            end
+        end
+
+        if #callback_keys > 0 then
+            local callback_vals = mget_chunked(red, callback_keys)
+            if callback_vals then
+                for _, item in ipairs(export_data.webhooks) do
+                    local idx = callback_index[item.key]
+                    if idx then
+                        local v = callback_vals[idx]
+                        if v and v ~= ngx.null then
+                            item.callback_url = v
+                        end
                     end
                 end
             end
@@ -1028,7 +1139,7 @@ elseif method == "GET" then
         local since = args.since and tonumber(args.since)
 
         local pattern = PREFIX .. category .. ":*"
-        local keys = red:keys(pattern)
+        local keys = scan_keys(red, pattern)
         if not keys or #keys == 0 then
             return send_json(200, {
                 keys = {},
@@ -1054,7 +1165,8 @@ elseif method == "GET" then
         table.sort(keys, function(a, b) return a > b end) -- latest first
 
         local list = {}
-        local vals, err = red:mget(unpack(keys))
+        local vals, err = mget_chunked(red, keys)
+        local ttls, terr = ttl_pipeline_chunked(red, keys)
         if vals then
             for i, val in ipairs(vals) do
                 local key_name = keys[i]
@@ -1068,9 +1180,13 @@ elseif method == "GET" then
                     end
 
                     -- Always include payload in REST API response for category listing
+                    local ttl = -1
+                    if ttls and ttls[i] ~= nil then
+                        ttl = tonumber(ttls[i]) or -1
+                    end
                     table.insert(list, {
                         key = string.gsub(key_name, "^" .. PREFIX, ""),  -- Remove prefix
-                        ttl = red:ttl(key_name) or -1,
+                        ttl = ttl,
                         created_at = decoded and decoded.created_at or nil,
                         category = decoded and decoded.category or category,
                         payload = decoded and decoded.payload or nil
@@ -1221,11 +1337,9 @@ elseif method == "DELETE" then
                 else
                     update_total_size(red, -#val)
                 end
-                red:del(full_key)
-
                 -- Also delete callback if exists
                 local callback_key = CALLBACK_PREFIX .. key_to_delete
-                red:del(callback_key)
+                red:del(full_key, callback_key)
 
                 table.insert(batch_results.deleted, key_to_delete)
                 batch_results.total_deleted = batch_results.total_deleted + 1
@@ -1255,11 +1369,9 @@ elseif method == "DELETE" then
         else
             update_total_size(red, -#val)
         end
-        red:del(full_key)
-
         -- Also delete callback if exists
         local callback_key = CALLBACK_PREFIX .. key_from_path
-        red:del(callback_key)
+        red:del(full_key, callback_key)
 
         -- Increment metrics
         increment_metric(red, "deleted_total")
