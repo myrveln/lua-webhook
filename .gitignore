@@ -39,6 +39,11 @@ test-results/
 coverage/
 *.test
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # Temporary files
 tmp/
 temp/
