@@ -117,7 +117,24 @@ local function read_request_body()
     return data
 end
 
+local function increment_metric(red, metric_name, value)
+    value = value or 1
+    local metric_key = METRICS_PREFIX .. metric_name
+    red:incrby(metric_key, value)
+end
+
 local function send_json(status, tbl, headers)
+    -- Track errors centrally for all JSON responses with HTTP status >= 400.
+    -- This keeps `webhook_errors_total` consistent across endpoints.
+    if status and status >= 400 then
+        local ctx_red = ngx.ctx and ngx.ctx.red
+        if ctx_red then
+            pcall(function()
+                increment_metric(ctx_red, "errors_total")
+            end)
+        end
+    end
+
     ngx.status = status
     ngx.header.content_type = "application/json"
 
@@ -274,12 +291,6 @@ local function search_webhooks(red, query)
     end
 
     return results
-end
-
-local function increment_metric(red, metric_name, value)
-    value = value or 1
-    local metric_key = METRICS_PREFIX .. metric_name
-    red:incrby(metric_key, value)
 end
 
 local function get_prometheus_metrics(red)
@@ -531,6 +542,10 @@ local ok, err = red:connect(REDIS_HOST, REDIS_PORT)
 if not ok then
     return send_json(500, { error = "Failed to connect to Redis: " .. (err or "unknown") })
 end
+
+-- Make the Redis client available to helper functions (e.g., send_json) for
+-- centralized metrics accounting.
+ngx.ctx.red = red
 
 -- Enforce API-key auth if configured.
 -- Applies to all endpoints unless exempted via WEBHOOK_AUTH_EXEMPT.
@@ -1265,6 +1280,5 @@ elseif method == "DELETE" then
 
 -- ===== OTHER METHODS =====
 else
-    increment_metric(red, "errors_total")
     return send_json(405, { error = "Method not allowed", error_code = "METHOD_NOT_ALLOWED" })
 end
