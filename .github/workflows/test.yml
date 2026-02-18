@@ -9,25 +9,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Start services
-      run: docker compose up -d --build
+    - name: Set up Docker Compose
+      uses: docker/setup-compose-action@v1
+      with:
+        version: latest
 
-    - name: Wait for OpenResty
-      run: |
-        for i in $(seq 1 60); do
-          if curl -fsS http://localhost:8080/webhook/_stats >/dev/null; then
-            exit 0
-          fi
-          sleep 1
-        done
-        docker compose ps
-        docker compose logs
-        exit 1
+    - name: Start services
+      run: bash .github/scripts/compose_up.sh 60
 
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.14'
 
     - name: Install dependencies
       run: |
@@ -41,7 +34,7 @@ jobs:
         cd tests
         # First pass (no-auth). Write coverage data, but defer XML generation
         # until after the auth-enabled pass so we can merge results.
-        pytest test_webhook.py -v --cov=. --cov-report=
+        pytest test_webhook.py test_events.py test_ws.py -v --cov=. --cov-report=
 
     - name: Stop services (no-auth)
       if: always()
@@ -51,19 +44,7 @@ jobs:
       env:
         WEBHOOK_API_KEYS: test-api-key
         WEBHOOK_AUTH_EXEMPT: _stats
-      run: docker compose up -d --build
-
-    - name: Wait for OpenResty (auth enabled)
-      run: |
-        for i in $(seq 1 60); do
-          if curl -fsS http://localhost:8080/webhook/_stats >/dev/null; then
-            exit 0
-          fi
-          sleep 1
-        done
-        docker compose ps
-        docker compose logs
-        exit 1
+      run: bash .github/scripts/compose_up.sh 60
 
     - name: Run auth tests
       env:
@@ -72,7 +53,7 @@ jobs:
       run: |
         cd tests
         # Second pass (auth enabled). Append to existing coverage data.
-        pytest test_webhook.py test_auth.py -v --cov=. --cov-append --cov-report=
+        pytest test_webhook.py test_events.py test_ws.py test_auth.py -v --cov=. --cov-append --cov-report=
 
     - name: Generate merged coverage.xml
       if: always()
@@ -83,30 +64,7 @@ jobs:
     - name: Coverage summary
       if: always()
       run: |
-        python - <<'PY'
-        import os
-        import pathlib
-        import xml.etree.ElementTree as ET
-
-        coverage_xml = pathlib.Path('tests/coverage.xml')
-        if not coverage_xml.exists():
-          print('No tests/coverage.xml found; skipping summary.')
-          raise SystemExit(0)
-
-        root = ET.parse(coverage_xml).getroot()
-        line_rate = float(root.attrib.get('line-rate', '0'))
-        percent = line_rate * 100
-
-        repo = os.environ.get('GITHUB_REPOSITORY', 'myrveln/lua-webhook')
-        codecov_url = f'https://codecov.io/gh/{repo}'
-        summary_path = pathlib.Path(os.environ['GITHUB_STEP_SUMMARY'])
-        summary_path.write_text(
-          '## Coverage\n\n'
-          f'- Line coverage: **{percent:.2f}%**\n'
-          f'- Codecov: {codecov_url}\n'
-        )
-        print(f'Line coverage: {percent:.2f}%')
-        PY
+        python .github/scripts/coverage_summary.py tests/coverage.xml
 
     - name: Upload coverage artifact
       if: always()

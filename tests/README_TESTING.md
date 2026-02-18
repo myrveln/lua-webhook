@@ -26,6 +26,12 @@ Verify the service is responding (default is port 8080):
 curl -fsS http://localhost:8080/webhook/_stats
 ```
 
+Note: the test suite includes a small startup wait (see `tests/conftest.py`) to reduce flakiness where `docker compose up -d` returns before OpenResty is accepting connections. You can tune the wait via:
+
+```bash
+export WEBHOOK_TEST_STARTUP_TIMEOUT_S=20
+```
+
 Stop the environment when done:
 
 ```bash
@@ -64,13 +70,20 @@ cd tests
 source venv/bin/activate
 
 # Run tests against the Docker Compose environment
-BASE_URL=http://localhost:8080/webhook pytest test_webhook.py -v
+BASE_URL=http://localhost:8080/webhook pytest -v \
+    test_webhook.py \
+    test_events.py \
+    test_ws.py
 
 # Deactivate when done
 deactivate
 ```
 
-Note: `test_webhook.py` automatically includes `X-API-Key` on all requests if you set `WEBHOOK_TEST_API_KEY`. This allows running the same functional suite against an auth-enabled deployment.
+Notes:
+
+- `test_webhook.py`, `test_events.py`, and `test_ws.py` automatically include `X-API-Key` on all requests if you set `WEBHOOK_TEST_API_KEY`. This allows running the same functional suite against an auth-enabled deployment.
+- `test_events.py` consumes Valkey/Redis Pub/Sub on the `webhook:events` channel. With the default Compose stack, this is available on `localhost:6379`. If you run Valkey elsewhere, set `VALKEY_HOST`/`VALKEY_PORT` (or `REDIS_HOST`/`REDIS_PORT`).
+- `test_ws.py` validates the real WebSocket endpoint at `GET /webhook/_ws`, which streams the same events as the Pub/Sub channel.
 
 ## Run Tests With Authentication Enabled
 
@@ -112,28 +125,39 @@ WEBHOOK_TEST_API_KEY="test-api-key" \
 pytest test_auth.py -v
 ```
 
-### 3) Run both suites locally (recommended flow)
+### 3) Run the full integration suite with auth enabled (recommended)
 
-Because enabling auth will make the existing no-auth tests fail (they intentionally do not send API keys), run them in two passes:
+With `WEBHOOK_TEST_API_KEY` set, the main integration tests will authenticate automatically.
 
 ```bash
-# Pass 1: run the original suite with auth disabled
+cd tests
+BASE_URL=http://localhost:8080/webhook \
+WEBHOOK_TEST_API_KEY="test-api-key" \
+pytest -v \
+    test_webhook.py \
+    test_events.py \
+    test_ws.py \
+    test_auth.py
+```
+
+### 4) Optional: run the same suite with auth disabled
+
+This is useful to ensure backwards compatibility for deployments that do not require an API key.
+
+```bash
+cd ..
+docker compose down
+
 unset WEBHOOK_API_KEYS
 unset WEBHOOK_AUTH_EXEMPT
 
-docker compose down
 docker compose up -d --build
 
 cd tests
-BASE_URL=http://localhost:8080/webhook pytest test_webhook.py -v
-
-# Pass 2: restart with auth enabled and run auth tests
-cd ..
-docker compose down
-WEBHOOK_API_KEYS="test-api-key" WEBHOOK_AUTH_EXEMPT="_stats" docker compose up -d --build
-
-cd tests
-BASE_URL=http://localhost:8080/webhook WEBHOOK_TEST_API_KEY="test-api-key" pytest test_webhook.py test_auth.py -v
+BASE_URL=http://localhost:8080/webhook pytest -v \
+    test_webhook.py \
+    test_events.py \
+    test_ws.py
 ```
 
 ### Notes
@@ -280,55 +304,6 @@ rm -rf venv
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
-
-## Troubleshooting
-
-### Virtual Environment Not Activating
-
-```bash
-# Make sure you're in the right directory
-cd tests
-
-# Use relative path
-source venv/bin/activate
-```
-
-### Wrong Python Version
-
-```bash
-# Check which Python is being used
-which python
-# Should show venv path, not system Python
-
-# If showing system Python, make sure venv is activated
-source venv/bin/activate
-```
-
-### Permission Denied Errors
-
-```bash
-# If you see permission errors, you're likely using system Python
-# Never use sudo with pip in a virtual environment
-# Instead, make sure venv is activated (no sudo needed):
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### SSL Verification Issues
-
-```python
-# Disable SSL verification (not recommended for production)
-response = requests.get(BASE_URL, verify=False)
-```
-
-### Valkey Connection
-
-Ensure Valkey is running:
-
-```bash
-docker compose exec -T valkey valkey-cli ping
-# Should return: PONG
 ```
 
 ## Best Practices
