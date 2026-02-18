@@ -348,6 +348,31 @@ local function get_prometheus_metrics(red)
     table.insert(output, "# TYPE webhook_auth_invalid_total counter")
     table.insert(output, string.format("webhook_auth_invalid_total %d", metrics.auth_invalid_total or 0))
 
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_ws_connected_total Total number of WebSocket connections")
+    table.insert(output, "# TYPE webhook_ws_connected_total counter")
+    table.insert(output, string.format("webhook_ws_connected_total %d", metrics.ws_connected_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_ws_disconnected_total Total number of WebSocket disconnects")
+    table.insert(output, "# TYPE webhook_ws_disconnected_total counter")
+    table.insert(output, string.format("webhook_ws_disconnected_total %d", metrics.ws_disconnected_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_ws_messages_sent_total Total number of messages sent over WebSocket")
+    table.insert(output, "# TYPE webhook_ws_messages_sent_total counter")
+    table.insert(output, string.format("webhook_ws_messages_sent_total %d", metrics.ws_messages_sent_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_ws_handshake_errors_total WebSocket handshake/setup errors")
+    table.insert(output, "# TYPE webhook_ws_handshake_errors_total counter")
+    table.insert(output, string.format("webhook_ws_handshake_errors_total %d", metrics.ws_handshake_errors_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_ws_backend_errors_total WebSocket backend (Valkey/Redis) errors")
+    table.insert(output, "# TYPE webhook_ws_backend_errors_total counter")
+    table.insert(output, string.format("webhook_ws_backend_errors_total %d", metrics.ws_backend_errors_total or 0))
+
     return table.concat(output, "\n") .. "\n"
 end
 
@@ -511,6 +536,11 @@ end
 -- Applies to all endpoints unless exempted via WEBHOOK_AUTH_EXEMPT.
 if AUTH_ENABLED and not AUTH_EXEMPT[category] then
     local presented = _get_presented_api_key()
+    -- Browsers can't set custom headers on WebSocket connections.
+    -- For GET /webhook/_ws, allow passing the key via query string.
+    if (not presented or presented == "") and category == "_ws" then
+        presented = args.api_key or args.token
+    end
     if not presented then
         increment_metric(red, "auth_missing_total")
         return send_json(401, {
@@ -805,6 +835,99 @@ if method == "POST" then
 -- ===== GET =====
 elseif method == "GET" then
     increment_metric(red, "requests_get")
+
+    -- GET /webhook/_ws - WebSocket event stream (bridges Valkey/Redis pub/sub channel `webhook:events`)
+    if category == "_ws" then
+        local ws_server = require "resty.websocket.server"
+
+        -- Keep the polling timeouts modest to avoid busy looping while still
+        -- delivering events with low latency.
+        local poll_timeout_ms = 250
+
+        local wb, werr = ws_server:new({
+            timeout = poll_timeout_ms,
+            max_payload_len = 64 * 1024
+        })
+        if not wb then
+            increment_metric(red, "ws_handshake_errors_total")
+            return send_json(400, {
+                error = "Failed to establish WebSocket connection",
+                error_code = "WS_HANDSHAKE_FAILED",
+                details = werr
+            })
+        end
+
+        -- Use a dedicated Valkey/Redis connection for pub/sub.
+        local pub = redis:new()
+        pub:set_timeout(poll_timeout_ms)
+        local pok, perr = pub:connect(REDIS_HOST, REDIS_PORT)
+        if not pok then
+            increment_metric(red, "ws_backend_errors_total")
+            wb:send_close()
+            return ngx.exit(200)
+        end
+
+        local sres, serr = pub:subscribe("webhook:events")
+        if not sres then
+            increment_metric(red, "ws_backend_errors_total")
+            wb:send_close()
+            return ngx.exit(200)
+        end
+
+        increment_metric(red, "ws_connected_total")
+        wb:send_text(cjson.encode({
+            type = "webhook.ws_ready",
+            timestamp = iso8601_timestamp(),
+            data = { channel = "webhook:events" }
+        }))
+
+        local function _ws_cleanup()
+            increment_metric(red, "ws_disconnected_total")
+            pcall(function()
+                pub:unsubscribe("webhook:events")
+            end)
+            pcall(function()
+                pub:close()
+            end)
+            pcall(function()
+                wb:send_close()
+            end)
+        end
+
+        while true do
+            -- 1) Bridge pub/sub messages to the WS client.
+            local reply, rerr = pub:read_reply()
+            if reply then
+                if reply[1] == "message" then
+                    local msg = reply[3]
+                    local bytes, send_err = wb:send_text(msg)
+                    if not bytes then
+                        break
+                    end
+                    increment_metric(red, "ws_messages_sent_total")
+                end
+            elseif rerr and rerr ~= "timeout" then
+                increment_metric(red, "ws_backend_errors_total")
+                break
+            end
+
+            -- 2) Drain/handle client frames so pings/closes are respected.
+            local data, typ, ferr = wb:recv_frame()
+            if wb.fatal then
+                break
+            end
+
+            if typ == "close" then
+                break
+            elseif typ == "ping" then
+                wb:send_pong(data)
+            end
+            -- Ignore text/binary frames for now.
+        end
+
+        _ws_cleanup()
+        return ngx.exit(200)
+    end
 
     -- GET /webhook/_metrics - Prometheus metrics endpoint
     if category == "_metrics" then
