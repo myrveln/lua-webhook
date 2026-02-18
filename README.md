@@ -20,7 +20,7 @@ A high-performance, RESTful webhook storage service built with OpenResty/Nginx a
 - 📈 **Response Headers** - Storage metrics in HTTP headers
 - 🔄 **Webhook Replay** - Replay webhooks to recreate them with new keys
 - 📤 **Export/Import** - Backup and restore webhooks with full data preservation
-- 📡 **WebSocket Events** - Real-time notifications via Valkey pub/sub
+- 📡 **Realtime Events** - Valkey/Redis pub/sub (`webhook:events`) and WebSocket stream (`GET /webhook/_ws`)
 - 📊 **Prometheus Metrics** - Built-in metrics endpoint for monitoring
 
 ## Requirements
@@ -471,14 +471,15 @@ curl -X POST https://your-domain.com/webhook/_import \
 curl https://your-domain.com/webhook/_metrics
 ```
 
-### Subscribe to WebSocket events
+### Subscribe to events (WebSocket or Pub/Sub)
 ```bash
-# Using Valkey CLI (compatible with Redis CLI)
-valkey-cli SUBSCRIBE webhook:events
-# or
-redis-cli SUBSCRIBE webhook:events
+# Option A: WebSocket stream
+# Connect to: ws(s)://your-domain.com/webhook/_ws
 
-# Or integrate in your application (see integration examples below)
+# Option B: Valkey/Redis Pub/Sub
+valkey-cli SUBSCRIBE webhook:events  # compatible with redis-cli
+
+# Integrate in your application (see integration examples below)
 ```
 
 ## Performance
@@ -488,12 +489,16 @@ redis-cli SUBSCRIBE webhook:events
 - **Lazy recalculation**: Storage metrics calculated periodically, not on every request
 - **Batch operations**: Process multiple webhooks in a single request
 - **Minimal overhead**: Direct Lua execution in Nginx worker processes
-- **Event-driven**: WebSocket events via Valkey pub/sub for real-time updates
+- **Event-driven**: Events are published to Valkey/Redis Pub/Sub and can be bridged to WebSocket clients
 - **Metrics collection**: Track usage patterns with minimal performance impact
 
-## WebSocket Event Integration
+## Event Integration (WebSocket + Pub/Sub)
 
-Webhook events are published to Valkey pub/sub channel `webhook:events` and can be consumed by your application to provide real-time notifications.
+Webhook events are published to Valkey/Redis pub/sub channel `webhook:events`.
+
+If you prefer a browser/client-friendly interface, the service also exposes a WebSocket endpoint that streams the same JSON messages:
+
+- `GET /webhook/_ws`
 
 ### Event Types
 
@@ -503,6 +508,19 @@ Webhook events are published to Valkey pub/sub channel `webhook:events` and can 
 - `webhook.replayed` - When a webhook is replayed
 
 ### Integration Examples
+
+**WebSocket (browser/Node.js):**
+```javascript
+// If API-key auth is enabled and you need a browser client, pass the key
+// via query string (browsers can't set custom WS headers):
+//   wss://your-domain.com/webhook/_ws?api_key=YOUR_KEY
+const ws = new WebSocket('wss://your-domain.com/webhook/_ws');
+
+ws.onmessage = (evt) => {
+  const event = JSON.parse(evt.data);
+  console.log('Event:', event.type, event.data);
+};
+```
 
 **Node.js with Socket.IO:**
 ```javascript
