@@ -1,0 +1,23 @@
+# Codecov configuration
+# Docs: https://docs.codecov.com/docs/codecov-yaml
+
+# Keep PR feedback, but don't make patch misses look like a failure.
+coverage:
+  status:
+    # Overall project coverage status
+    project:
+      default:
+        target: auto
+        threshold: 1%
+
+    # Patch/diff coverage status (coverage of the lines changed in the PR)
+    patch:
+      default:
+        target: auto
+        threshold: 5%
+        informational: true
+
+comment:
+  layout: "reach,diff,flags,tree"
+  behavior: default
+  require_changes: false
