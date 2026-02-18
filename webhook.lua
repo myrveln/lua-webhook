@@ -17,6 +17,88 @@ local RECALC_INTERVAL = 300                   -- seconds, 5 minutes
 local REDIS_HOST = os.getenv("VALKEY_HOST") or os.getenv("REDIS_HOST") or "127.0.0.1"
 local REDIS_PORT = tonumber(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT")) or 6379
 
+-- ==== AUTHENTICATION (optional) ====
+-- Set one or more API keys to require auth on all endpoints.
+--
+-- Option A (recommended): set env var WEBHOOK_API_KEYS="key1,key2" (and ensure nginx passes it via `env WEBHOOK_API_KEYS;`).
+-- Option B: hardcode keys in STATIC_API_KEYS below.
+--
+-- Exempt endpoints (by the 2nd path segment, e.g. "_metrics") can be provided via:
+--   WEBHOOK_AUTH_EXEMPT="_metrics,_stats"
+local STATIC_API_KEYS = {}
+local AUTH_API_KEYS_ENV = os.getenv("WEBHOOK_API_KEYS")
+local AUTH_EXEMPT_ENV = os.getenv("WEBHOOK_AUTH_EXEMPT") or ""
+
+local function _trim(s)
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function _split_csv(s)
+    local out = {}
+    if not s or s == "" then
+        return out
+    end
+    for part in string.gmatch(s, "[^,]+") do
+        local v = _trim(part)
+        if v ~= "" then
+            table.insert(out, v)
+        end
+    end
+    return out
+end
+
+local function _build_auth_state()
+    local keys = {}
+    for _, k in ipairs(STATIC_API_KEYS) do
+        if type(k) == "string" and k ~= "" then
+            table.insert(keys, k)
+        end
+    end
+    for _, k in ipairs(_split_csv(AUTH_API_KEYS_ENV)) do
+        table.insert(keys, k)
+    end
+
+    local exempt = {}
+    for _, e in ipairs(_split_csv(AUTH_EXEMPT_ENV)) do
+        exempt[e] = true
+    end
+
+    return keys, exempt
+end
+
+local API_KEYS, AUTH_EXEMPT = _build_auth_state()
+local AUTH_ENABLED = (#API_KEYS > 0)
+
+local function _get_presented_api_key()
+    local headers = ngx.req.get_headers()
+    local key = headers["x-api-key"] or headers["X-API-Key"]
+    if key and type(key) == "string" and key ~= "" then
+        return key
+    end
+
+    local auth = headers["authorization"] or headers["Authorization"]
+    if auth and type(auth) == "string" then
+        local bearer = auth:match("^[Bb]earer%s+(.+)$")
+        if bearer and bearer ~= "" then
+            return bearer
+        end
+    end
+
+    return nil
+end
+
+local function _api_key_is_valid(presented)
+    if not presented or presented == "" then
+        return false
+    end
+    for _, allowed in ipairs(API_KEYS) do
+        if presented == allowed then
+            return true
+        end
+    end
+    return false
+end
+
 -- ==== UTILS ====
 local function read_request_body()
     ngx.req.read_body()
@@ -256,6 +338,16 @@ local function get_prometheus_metrics(red)
     table.insert(output, "# TYPE webhook_errors_total counter")
     table.insert(output, string.format("webhook_errors_total %d", metrics.errors_total or 0))
 
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_auth_missing_total Requests missing an API key")
+    table.insert(output, "# TYPE webhook_auth_missing_total counter")
+    table.insert(output, string.format("webhook_auth_missing_total %d", metrics.auth_missing_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_auth_invalid_total Requests with an invalid API key")
+    table.insert(output, "# TYPE webhook_auth_invalid_total counter")
+    table.insert(output, string.format("webhook_auth_invalid_total %d", metrics.auth_invalid_total or 0))
+
     return table.concat(output, "\n") .. "\n"
 end
 
@@ -413,6 +505,29 @@ red:set_timeout(1000)
 local ok, err = red:connect(REDIS_HOST, REDIS_PORT)
 if not ok then
     return send_json(500, { error = "Failed to connect to Redis: " .. (err or "unknown") })
+end
+
+-- Enforce API-key auth if configured.
+-- Applies to all endpoints unless exempted via WEBHOOK_AUTH_EXEMPT.
+if AUTH_ENABLED and not AUTH_EXEMPT[category] then
+    local presented = _get_presented_api_key()
+    if not presented then
+        increment_metric(red, "auth_missing_total")
+        return send_json(401, {
+            error = "Missing API key",
+            error_code = "AUTH_REQUIRED",
+            hint = "Provide X-API-Key or Authorization: Bearer <token>"
+        }, {
+            ["WWW-Authenticate"] = 'Bearer realm="webhook"'
+        })
+    end
+    if not _api_key_is_valid(presented) then
+        increment_metric(red, "auth_invalid_total")
+        return send_json(403, {
+            error = "Invalid API key",
+            error_code = "AUTH_INVALID"
+        })
+    end
 end
 
 -- ===== POST =====

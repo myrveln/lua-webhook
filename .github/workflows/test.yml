@@ -39,7 +39,46 @@ jobs:
         BASE_URL: http://localhost:8080/webhook
       run: |
         cd tests
-        pytest test_webhook.py -v --cov=. --cov-report=xml
+        # First pass (no-auth). Write coverage data, but defer XML generation
+        # until after the auth-enabled pass so we can merge results.
+        pytest test_webhook.py -v --cov=. --cov-report=
+
+    - name: Stop services (no-auth)
+      if: always()
+      run: docker compose down
+
+    - name: Start services (auth enabled)
+      env:
+        WEBHOOK_API_KEYS: test-api-key
+        WEBHOOK_AUTH_EXEMPT: _stats
+      run: docker compose up -d --build
+
+    - name: Wait for OpenResty (auth enabled)
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS http://localhost:8080/webhook/_stats >/dev/null; then
+            exit 0
+          fi
+          sleep 1
+        done
+        docker compose ps
+        docker compose logs
+        exit 1
+
+    - name: Run auth tests
+      env:
+        BASE_URL: http://localhost:8080/webhook
+        WEBHOOK_TEST_API_KEY: test-api-key
+      run: |
+        cd tests
+        # Second pass (auth enabled). Append to existing coverage data.
+        pytest test_webhook.py test_auth.py -v --cov=. --cov-append --cov-report=
+
+    - name: Generate merged coverage.xml
+      if: always()
+      run: |
+        cd tests
+        coverage xml -o coverage.xml
 
     - name: Coverage summary
       if: always()

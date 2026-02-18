@@ -16,6 +16,8 @@ services:
     environment:
       REDIS_HOST: valkey
       REDIS_PORT: "6379"
+      WEBHOOK_API_KEYS: ${WEBHOOK_API_KEYS:-}
+      WEBHOOK_AUTH_EXEMPT: ${WEBHOOK_AUTH_EXEMPT:-}
     depends_on:
       valkey:
         condition: service_healthy

@@ -555,17 +555,27 @@ scrape_configs:
 - `webhook_storage_limit_bytes` - Storage limit (gauge)
 - `webhook_count` - Current number of webhooks (gauge)
 - `webhook_errors_total` - Total errors encountered (counter)
+- `webhook_auth_missing_total` - Requests missing an API key (counter)
+- `webhook_auth_invalid_total` - Requests with an invalid API key (counter)
 
 ## Security Considerations
 
-⚠️ **Important**: This webhook service does not include built-in authentication. Before deploying to production:
+⚠️ **Important**: This webhook service does not include built-in authentication by default. Before deploying to production:
 
 1. Implement authentication (API keys, OAuth, etc.)
-2. Add rate limiting
+2. Add rate limiting (Nginx `limit_req` / `limit_conn` are the usual approach)
 3. Use HTTPS/TLS encryption
 4. Restrict access via firewall rules
-5. Monitor for abuse
+5. Monitor for abuse (Prometheus metrics are exposed at `/webhook/_metrics`)
 6. Consider using nginx's built-in security modules
+
+### API key authentication (optional)
+
+`webhook.lua` supports a simple API-key gate:
+
+- Set `WEBHOOK_API_KEYS="key1,key2"` and configure Nginx/OpenResty to pass the env var (via `env WEBHOOK_API_KEYS;`).
+- Send the key as `X-API-Key: ...` or `Authorization: Bearer ...`.
+- Optionally exempt endpoints like metrics: `WEBHOOK_AUTH_EXEMPT="_metrics"`.
 
 ## License
 

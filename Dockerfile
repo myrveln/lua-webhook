@@ -19,6 +19,8 @@ RUN sed -i 's|/path/to/webhook/webhook.lua|/usr/local/openresty/webhook.lua|' \
             'env REDIS_PORT;' \
             'env VALKEY_HOST;' \
             'env VALKEY_PORT;' \
+                        'env WEBHOOK_API_KEYS;' \
+                        'env WEBHOOK_AUTH_EXEMPT;' \
             > /etc/nginx/conf.d/valkey-env.main \
     && printf '%s\n' \
       'server {' \
