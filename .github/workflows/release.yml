@@ -12,6 +12,7 @@ concurrency:
 permissions:
   contents: write
   pull-requests: read
+  actions: write
 
 jobs:
   release:
@@ -146,3 +147,13 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.next }}
           generate_release_notes: true
+
+      - name: Trigger LuaRocks publish
+        if: ${{ steps.bump.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.next }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run publish-luarocks.yml -f tag="$TAG"
