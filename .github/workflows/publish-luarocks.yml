@@ -1,6 +1,6 @@
 name: Publish to LuaRocks
 
-"on":
+on:
   release:
     types:
       - published
