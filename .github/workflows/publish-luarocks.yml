@@ -1,8 +1,9 @@
 name: Publish to LuaRocks
 
-on:
+"on":
   release:
-    types: [published]
+    types:
+      - published
 
 permissions:
   contents: read
