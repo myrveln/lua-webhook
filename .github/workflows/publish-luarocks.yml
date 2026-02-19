@@ -43,7 +43,9 @@ jobs:
       - name: Set up LuaRocks
         uses: leafo/gh-actions-luarocks@v6
         with:
-          luaRocksVersion: "3.9.2"
+          # LuaRocks 3.9.x has known edge-case issues around manifest rebuilds.
+          # Use a newer version for packaging verification.
+          luaRocksVersion: "3.12.2"
 
       - name: Generate release rockspec
         id: rockspec
@@ -81,9 +83,10 @@ jobs:
           # Ensure the rockspec is buildable/installable.
           # Note: this does not execute OpenResty request handling at runtime;
           # it only validates packaging + dependency resolution.
-          luarocks make --tree "./_luarocks" --deps-mode=all "${{ steps.rockspec.outputs.path }}"
+          # Install into the default tree configured by the setup action.
+          luarocks make --deps-mode=all "${{ steps.rockspec.outputs.path }}"
 
-          test -f "./_luarocks/share/lua/5.1/webhook.lua"
+          test -f "./.luarocks/share/lua/5.1/webhook.lua"
 
       - name: Pack source rock (sanity)
         shell: bash
@@ -115,6 +118,6 @@ jobs:
         uses: MunifTanjim/luarocks-publish-action@v1
         with:
           lua_version: 5.1.5
-          luarocks_version: 3.9.2
+          luarocks_version: 3.12.2
           version: ${{ steps.v.outputs.version }}
           api_key: ${{ secrets.LUAROCKS_API_KEY }}
