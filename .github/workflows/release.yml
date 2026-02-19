@@ -102,57 +102,69 @@ jobs:
 
           bump="${{ steps.bump.outputs.bump }}"
 
-          latest="$(git tag --list --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
-          if [[ -z "$latest" ]]; then
-            next="0.1.0"
+          # Prefer v-prefixed semver tags (v0.1.0) but also accept legacy (0.1.0).
+          latest_version="$({
+            git tag --list \
+              | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sed 's/^v//' \
+              | sort -V \
+              | tail -n 1
+          } 2>/dev/null || true)"
+
+          if [[ -z "$latest_version" ]]; then
+            next_version="0.1.0"
           else
-            IFS='.' read -r major minor patch <<<"$latest"
+            IFS='.' read -r major minor patch <<<"$latest_version"
             case "$bump" in
               major)
-                next="$((major + 1)).0.0"
+                next_version="$((major + 1)).0.0"
                 ;;
               minor)
-                next="${major}.$((minor + 1)).0"
+                next_version="${major}.$((minor + 1)).0"
                 ;;
               patch|*)
-                next="${major}.${minor}.$((patch + 1))"
+                next_version="${major}.${minor}.$((patch + 1))"
                 ;;
             esac
           fi
 
-          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
-            echo "Tag already exists: ${next}" >&2
+          next_tag="v${next_version}"
+
+          if git rev-parse -q --verify "refs/tags/${next_tag}" >/dev/null; then
+            echo "Tag already exists: ${next_tag}" >&2
             exit 1
           fi
 
-          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "version=${next_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${next_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
         if: ${{ steps.bump.outputs.skip != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.next }}"
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
           sha="${{ github.event.workflow_run.head_sha }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git tag -a "$version" "$sha" -m "Release $version"
-          git push origin "$version"
+          git tag -a "$tag" "$sha" -m "Release $version"
+          git push origin "$tag"
 
       - name: Create GitHub Release
         if: ${{ steps.bump.outputs.skip != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.next }}
+          tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
 
       - name: Trigger LuaRocks publish
         if: ${{ steps.bump.outputs.skip != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.next }}
+          TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
