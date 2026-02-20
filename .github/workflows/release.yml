@@ -180,4 +180,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run publish-luarocks.yml -f tag="$TAG"
+          gh workflow run publish-luarocks.yml -f tag="$TAG" -f publish=true
