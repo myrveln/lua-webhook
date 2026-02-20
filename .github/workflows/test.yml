@@ -5,6 +5,8 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
     - uses: actions/checkout@v4
@@ -87,7 +89,8 @@ jobs:
       run: docker compose down
 
     - name: Upload coverage
-      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && env.CODECOV_TOKEN != ''
       uses: codecov/codecov-action@v5
       with:
+        token: ${{ env.CODECOV_TOKEN }}
         files: tests/coverage.xml
