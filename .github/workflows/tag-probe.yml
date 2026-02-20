@@ -1,0 +1,62 @@
+name: Tag Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to try pushing (default: v0.0.0-probe-<run_id>)"
+        required: false
+        type: string
+      delete_after:
+        description: "Attempt to delete the tag after pushing (best-effort)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide tag
+        id: t
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_input="${{ inputs.tag }}"
+          if [[ -n "$tag_input" ]]; then
+            tag="$tag_input"
+          else
+            tag="v0.0.0-probe-${GITHUB_RUN_ID}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.t.outputs.tag }}"
+          sha="${GITHUB_SHA}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$tag" "$sha" -m "Tag probe $tag"
+          git push origin "$tag"
+
+      - name: Delete tag (best-effort)
+        if: ${{ inputs.delete_after }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.t.outputs.tag }}"
+          git push --delete origin "$tag"
