@@ -108,6 +108,15 @@ jobs:
       TAG_NAME: ${{ github.event.release.tag_name || github.event.inputs.tag }}
 
     steps:
+      - name: Install Lua build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libreadline-dev \
+            libncurses-dev
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
