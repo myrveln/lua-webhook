@@ -84,11 +84,14 @@ def _delete_keys(keys: list[str]) -> None:
 
 
 def test__delete_keys_empty_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _boom(*args, **kwargs):
-        raise AssertionError("requests.delete must not be called for empty keys")
+    called = {"delete": False}
 
-    monkeypatch.setattr(requests, "delete", _boom)
+    def _mark_called(*args, **kwargs):
+        called["delete"] = True
+
+    monkeypatch.setattr(requests, "delete", _mark_called)
     _delete_keys([])
+    assert called["delete"] is False
 
 
 def _compact_json(obj: dict) -> str:
