@@ -60,6 +60,17 @@ def _list_keys() -> list[str]:
     return out
 
 
+def test__list_keys_accepts_string_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"keys": ["k1", {"key": "k2"}]}
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _Resp())
+    assert _list_keys() == ["k1", "k2"]
+
+
 def _delete_keys(keys: list[str]) -> None:
     if not keys:
         return
@@ -70,6 +81,14 @@ def _delete_keys(keys: list[str]) -> None:
     )
     # If the server rejected the request, show detail.
     assert resp.status_code == 200, resp.text
+
+
+def test__delete_keys_empty_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*args, **kwargs):
+        raise AssertionError("requests.delete must not be called for empty keys")
+
+    monkeypatch.setattr(requests, "delete", _boom)
+    _delete_keys([])
 
 
 def _compact_json(obj: dict) -> str:
