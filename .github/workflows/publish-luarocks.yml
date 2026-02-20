@@ -10,6 +10,11 @@ on:
         description: "Git tag to publish (e.g. 0.1.0 or v0.1.0)"
         required: true
         type: string
+      publish:
+        description: "Actually publish to LuaRocks (when false, only runs verify)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -96,7 +101,7 @@ jobs:
           luarocks pack "${{ steps.rockspec.outputs.path }}"
 
   publish:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release && github.event.release.prerelease != true) }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish == true) || (github.event.release && github.event.release.prerelease != true) }}
     runs-on: ubuntu-latest
     needs: verify
     env:
