@@ -82,9 +82,13 @@ jobs:
             if bump or skip:
               source = "commit-message"
 
-          if not bump:
+          # Safety: do not create releases by default.
+          # Only release when explicitly requested via PR label (release:patch/minor/major)
+          # or commit message marker (release:patch/minor/major).
+          if not bump and not skip:
+            skip = True
             bump = "patch"
-            source = source or "default"
+            source = source or "default-skip"
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
             f.write(f"skip={'true' if skip else 'false'}\n")
