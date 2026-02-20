@@ -92,7 +92,6 @@ jobs:
             f.write(f"source={source}\n")
           PY
 
-
       - name: Compute next version
         id: version
         if: ${{ steps.bump.outputs.skip != 'true' }}
@@ -102,7 +101,6 @@ jobs:
 
           bump="${{ steps.bump.outputs.bump }}"
 
-          # Prefer v-prefixed semver tags (v0.1.0) but also accept legacy (0.1.0).
           latest_version="$({
             git tag --list \
               | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -112,7 +110,8 @@ jobs:
           } 2>/dev/null || true)"
 
           if [[ -z "$latest_version" ]]; then
-            next_version="0.1.0"
+            # Start with v0.0.1 so we can validate automation before the first stable-ish v0.1.0.
+            next_version="0.0.1"
           else
             IFS='.' read -r major minor patch <<<"$latest_version"
             case "$bump" in
@@ -130,6 +129,15 @@ jobs:
 
           next_tag="v${next_version}"
 
+          IFS='.' read -r next_major next_minor next_patch <<<"$next_version"
+          if [[ "$next_major" -eq 0 && "$next_minor" -eq 0 ]]; then
+            prerelease="true"
+            publish_luarocks="false"
+          else
+            prerelease="false"
+            publish_luarocks="true"
+          fi
+
           if git rev-parse -q --verify "refs/tags/${next_tag}" >/dev/null; then
             echo "Tag already exists: ${next_tag}" >&2
             exit 1
@@ -137,12 +145,15 @@ jobs:
 
           echo "version=${next_version}" >> "$GITHUB_OUTPUT"
           echo "tag=${next_tag}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "publish_luarocks=${publish_luarocks}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
         if: ${{ steps.bump.outputs.skip != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
+
           tag="${{ steps.version.outputs.tag }}"
           version="${{ steps.version.outputs.version }}"
           sha="${{ github.event.workflow_run.head_sha }}"
@@ -159,9 +170,10 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          prerelease: ${{ steps.version.outputs.prerelease }}
 
       - name: Trigger LuaRocks publish
-        if: ${{ steps.bump.outputs.skip != 'true' }}
+        if: ${{ steps.bump.outputs.skip != 'true' && steps.version.outputs.publish_luarocks == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
