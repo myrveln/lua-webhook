@@ -5,6 +5,8 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
     - uses: actions/checkout@v4
@@ -30,11 +32,13 @@ jobs:
     - name: Run tests
       env:
         BASE_URL: http://localhost:8080/webhook
+        BASE_URL_CONFIG: http://localhost:8081/webhook
+        WEBHOOK_TEST_CONFIG_API_KEY: test-config-key
       run: |
         cd tests
         # First pass (no-auth). Write coverage data, but defer XML generation
         # until after the auth-enabled pass so we can merge results.
-        pytest test_webhook.py test_events.py test_ws.py -v --cov=. --cov-report=
+        pytest test_webhook.py test_events.py test_ws.py test_config.py -v --cov=. --cov-report=
 
     - name: Stop services (no-auth)
       if: always()
@@ -49,11 +53,13 @@ jobs:
     - name: Run auth tests
       env:
         BASE_URL: http://localhost:8080/webhook
+        BASE_URL_CONFIG: http://localhost:8081/webhook
         WEBHOOK_TEST_API_KEY: test-api-key
+        WEBHOOK_TEST_CONFIG_API_KEY: test-config-key
       run: |
         cd tests
         # Second pass (auth enabled). Append to existing coverage data.
-        pytest test_webhook.py test_events.py test_ws.py test_auth.py -v --cov=. --cov-append --cov-report=
+        pytest test_webhook.py test_events.py test_ws.py test_auth.py test_config.py -v --cov=. --cov-append --cov-report=
 
     - name: Generate merged coverage.xml
       if: always()
@@ -83,7 +89,8 @@ jobs:
       run: docker compose down
 
     - name: Upload coverage
-      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && env.CODECOV_TOKEN != ''
       uses: codecov/codecov-action@v5
       with:
+        token: ${{ env.CODECOV_TOKEN }}
         files: tests/coverage.xml

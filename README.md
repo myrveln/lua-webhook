@@ -32,44 +32,58 @@ A high-performance, RESTful webhook storage service built with OpenResty/Nginx a
 
 ## Installation
 
-### Clone and Configure
+### Install with LuaRocks
+
+If you already have LuaRocks set up for your OpenResty/Lua environment, you can install `lua-webhook` directly:
 
 ```bash
-git clone https://github.com/myrveln/lua-webhook.git
-cd lua-webhook
+# Install the latest release
+luarocks install lua-webhook
 
-# Edit nginx-example.conf to update the webhook.lua path
-
-# Include it in your existing server block in nginx.conf:
-#   server {
-#       listen 80;
-#       server_name yourdomain.com;
-#
-#       include /full/path/to/lua-webhook/nginx-example.conf;
-#
-#       # ... rest of your server config
-#   }
-
-# Test the configuration
-sudo openresty -t
-
-# Reload OpenResty
-sudo openresty -s reload
+# Or install a specific release (LuaRocks uses "<version>-<rockspec_revision>")
+# luarocks install lua-webhook 0.1.0-1
 ```
+
+Note: OpenResty typically runs LuaJIT (Lua 5.1 compatible). Make sure your LuaRocks installation targets the same Lua/LuaJIT that OpenResty is using.
+
+This project is distributed as a single Lua file (`webhook.lua`). After installation, locate it so you can reference it from your Nginx/OpenResty config:
+
+```bash
+# Prints the installed path to the module file (e.g. .../share/lua/5.1/webhook.lua)
+luarocks which webhook
+```
+
+Then edit [examples/nginx-example.conf](examples/nginx-example.conf) to point at that file path (or copy the file into your preferred location and point Nginx/OpenResty at the copy).
 
 ### Configuration
 
-Edit `webhook.lua` to customize settings:
+If you installed via LuaRocks, avoid editing the installed `webhook.lua` directly (a `luarocks upgrade` may replace it). Instead, configure the service via environment variables and/or a local override module.
+
+**Option A: Environment variables (recommended)**
+
+Configure values like Redis/Valkey and defaults using env vars. In OpenResty, remember to allowlist env vars in `nginx.conf` (e.g. `env WEBHOOK_DEFAULT_TTL;`).
+
+Common variables:
+
+- `VALKEY_HOST` / `VALKEY_PORT` (or `REDIS_HOST` / `REDIS_PORT`)
+- `WEBHOOK_DEFAULT_CATEGORY`, `WEBHOOK_DEFAULT_TTL`, `WEBHOOK_MAX_BODY_SIZE`, `WEBHOOK_TOTAL_PAYLOAD_LIMIT`
+- `WEBHOOK_API_KEYS`, `WEBHOOK_AUTH_EXEMPT` (for auth)
+
+**Option B: Local override module**
+
+Create a `webhook_config.lua` file somewhere stable (e.g. `/etc/openresty/lua/webhook_config.lua`) and add that directory to `lua_package_path`. The module should return a Lua table (see [examples/webhook_config.lua](examples/webhook_config.lua)):
 
 ```lua
-local PREFIX = "webhook:"                     -- Valkey key prefix
-local DEFAULT_CATEGORY = "default"            -- Default category name
-local DEFAULT_TTL = 259200                    -- 3 days in seconds
-local MAX_BODY_SIZE = 1024 * 1024             -- 1 MB max payload
-local TOTAL_PAYLOAD_LIMIT = 50 * 1024 * 1024  -- 50 MB total storage
-local REDIS_HOST = "127.0.0.1"
-local REDIS_PORT = 6379
+-- /etc/openresty/lua/webhook_config.lua
+return {
+  DEFAULT_TTL = 86400,
+  TOTAL_PAYLOAD_LIMIT = 100 * 1024 * 1024,
+  API_KEYS = {"changeme"},
+  AUTH_EXEMPT = {"_metrics", "_stats"},
+}
 ```
+
+Then OpenResty will pick it up automatically (or set `WEBHOOK_CONFIG_MODULE` to load a differently named module).
 
 ## API Documentation
 

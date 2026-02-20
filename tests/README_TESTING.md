@@ -40,6 +40,8 @@ docker compose down
 
 ## Python Environment Setup
 
+Note: if `python` on your machine is not Python 3, use `python3` in the commands below.
+
 **Benefits:**
 - Isolated environments per project
 - Clean dependency management
@@ -115,14 +117,55 @@ curl -i -H "X-API-Key: test-api-key" http://localhost:8080/webhook
 
 ### 2) Run the auth tests
 
-From `tests/` with your venv active:
+From the repository root (or any directory), with your venv available:
 
 ```bash
 cd tests
+source venv/bin/activate
 
 BASE_URL=http://localhost:8080/webhook \
 WEBHOOK_TEST_API_KEY="test-api-key" \
-pytest test_auth.py -v
+pytest -v test_auth.py
+```
+
+## Run Config Module Tests
+
+The repository includes integration tests that validate loading settings from a local override module (`WEBHOOK_CONFIG_MODULE`).
+
+The default `docker-compose.yml` defines a second OpenResty instance (`openresty_config`) on port 8081 that mounts a test module from `tests/fixtures/webhook_config_test.lua`.
+
+Start the stack (this will bring up both `openresty` and `openresty_config`):
+
+```bash
+docker compose up -d --build
+```
+
+Then run the config tests:
+
+```bash
+cd tests
+source venv/bin/activate
+
+BASE_URL_CONFIG=http://localhost:8081/webhook \
+WEBHOOK_TEST_CONFIG_API_KEY="test-config-key" \
+pytest -v test_config.py
+```
+
+### Run the full suite (CI parity)
+
+This runs *all* tests, including config-module tests:
+
+```bash
+cd tests
+source venv/bin/activate
+
+BASE_URL=http://localhost:8080/webhook \
+BASE_URL_CONFIG=http://localhost:8081/webhook \
+WEBHOOK_TEST_API_KEY="test-api-key" \
+WEBHOOK_TEST_CONFIG_API_KEY="test-config-key" \
+pytest -v
+
+deactivate
 ```
 
 ### 3) Run the full integration suite with auth enabled (recommended)
@@ -131,6 +174,8 @@ With `WEBHOOK_TEST_API_KEY` set, the main integration tests will authenticate au
 
 ```bash
 cd tests
+source venv/bin/activate
+
 BASE_URL=http://localhost:8080/webhook \
 WEBHOOK_TEST_API_KEY="test-api-key" \
 pytest -v \
@@ -138,6 +183,8 @@ pytest -v \
     test_events.py \
     test_ws.py \
     test_auth.py
+
+deactivate
 ```
 
 ### 4) Optional: run the same suite with auth disabled
@@ -148,16 +195,19 @@ This is useful to ensure backwards compatibility for deployments that do not req
 cd ..
 docker compose down
 
-unset WEBHOOK_API_KEYS
-unset WEBHOOK_AUTH_EXEMPT
-
-docker compose up -d --build
+# Start compose with auth explicitly disabled for this invocation (avoids relying on your shell
+# environment state).
+WEBHOOK_API_KEYS= WEBHOOK_AUTH_EXEMPT= docker compose up -d --build
 
 cd tests
+source venv/bin/activate
+
 BASE_URL=http://localhost:8080/webhook pytest -v \
     test_webhook.py \
     test_events.py \
     test_ws.py
+
+deactivate
 ```
 
 ### Notes
@@ -179,6 +229,11 @@ BASE_URL=http://localhost:8080/webhook pytest -v \
 | `TestWebhookExportImport` | Backup/restore | Export, import functionality |
 | `TestWebhookMetrics` | Monitoring | Prometheus metrics |
 | `TestWebhookLargePayloads` | Performance | Large JSON handling |
+| `TestWebhookAuthentication` | Authentication | API key enforcement, exemptions |
+| `TestWebhookEventPublishing` | Events | Valkey/Redis Pub/Sub webhook events |
+| `TestWebhookConfigModule` | Configuration | Config-module overrides and limits |
+
+Note: `test_ws.py` is function-based (no test class) and covers the WebSocket endpoint.
 
 ### Running Specific Test Categories
 
@@ -237,27 +292,6 @@ pip install pytest-xdist
 
 # Run tests in parallel
 pytest test_webhook.py -n auto
-```
-
-## Test Data Cleanup
-
-After testing, you may want to clean up test data:
-
-```bash
-# Using valkey-cli inside the Compose container
-docker compose exec -T valkey valkey-cli --scan --pattern "test:*" | xargs docker compose exec -T valkey valkey-cli del
-docker compose exec -T valkey valkey-cli --scan --pattern "batch-test:*" | xargs docker compose exec -T valkey valkey-cli del
-
-# Using Python
-python -c "
-import redis
-r = redis.Redis()  # redis library is compatible with Valkey
-for pattern in ['test:*', 'batch-test:*', 'export-*']:
-    keys = r.keys(pattern)
-    if keys:
-        r.delete(*keys)
-print('Cleanup complete')
-"
 ```
 
 ## Environment Management

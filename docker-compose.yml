@@ -26,3 +26,23 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Second instance used by ./tests/test_config.py to validate webhook_config module overrides.
+  openresty_config:
+    build: .
+    ports:
+      - "8081:80"
+    environment:
+      REDIS_HOST: valkey
+      REDIS_PORT: "6379"
+      WEBHOOK_CONFIG_MODULE: webhook_config_test
+    volumes:
+      - ./tests/fixtures/webhook_config_test.lua:/usr/local/openresty/lualib/webhook_config_test.lua:ro
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/webhook/_stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
