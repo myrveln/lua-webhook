@@ -3,19 +3,151 @@ cjson.encode_escape_forward_slash(false)
 local redis = require "resty.redis"
 
 -- ==== SETTINGS ====
-local PREFIX = "webhook:"                     -- prefix for all keys
-local CALLBACK_PREFIX = "webhook:callback:"   -- prefix for callback URLs
-local METRICS_PREFIX = "webhook:metrics:"     -- prefix for metrics
-local WEBSOCKET_PREFIX = "webhook:ws:"        -- prefix for WebSocket subscriptions
-local DEFAULT_CATEGORY = "default"            -- fallback category
-local DEFAULT_TTL = 259200                    -- 3 days in seconds
-local MAX_BODY_SIZE = 1024 * 1024             -- 1 MB
-local TOTAL_PAYLOAD_LIMIT = 50 * 1024 * 1024  -- 50 MB total
+-- IMPORTANT: Avoid editing this file directly when installed via LuaRocks.
+-- Instead, override settings via environment variables and/or a local module.
+--
+-- Environment overrides (examples):
+--   WEBHOOK_PREFIX=webhook:
+--   WEBHOOK_DEFAULT_CATEGORY=default
+--   WEBHOOK_DEFAULT_TTL=259200
+--   WEBHOOK_MAX_BODY_SIZE=1048576
+--   WEBHOOK_TOTAL_PAYLOAD_LIMIT=52428800
+--   WEBHOOK_RECALC_INTERVAL=300
+--   WEBHOOK_REDIS_HOST=127.0.0.1
+--   WEBHOOK_REDIS_PORT=6379
+--
+-- Local module override (optional):
+--   Create a `webhook_config.lua` in your `lua_package_path` that returns a table
+--   with any of the keys below (e.g. { DEFAULT_TTL = 86400 }).
+
+local function _env_str(name)
+    local v = os.getenv(name)
+    if v and v ~= "" then
+        return v
+    end
+    return nil
+end
+
+local function _env_num(name)
+    local v = _env_str(name)
+    if not v then
+        return nil
+    end
+    local n = tonumber(v)
+    if n == nil then
+        return nil
+    end
+    return n
+end
+
+local function _normalize_prefix(prefix)
+    if not prefix or prefix == "" then
+        return "webhook:"
+    end
+    if prefix:sub(-1) ~= ":" then
+        return prefix .. ":"
+    end
+    return prefix
+end
+
+local SETTINGS = {
+    PREFIX = _normalize_prefix(_env_str("WEBHOOK_PREFIX") or "webhook:"),
+    DEFAULT_CATEGORY = _env_str("WEBHOOK_DEFAULT_CATEGORY") or "default",
+    DEFAULT_TTL = _env_num("WEBHOOK_DEFAULT_TTL") or 259200, -- 3 days
+    MAX_BODY_SIZE = _env_num("WEBHOOK_MAX_BODY_SIZE") or (1024 * 1024), -- 1 MB
+    TOTAL_PAYLOAD_LIMIT = _env_num("WEBHOOK_TOTAL_PAYLOAD_LIMIT") or (50 * 1024 * 1024), -- 50 MB
+    RECALC_INTERVAL = _env_num("WEBHOOK_RECALC_INTERVAL") or 300, -- seconds
+    -- Prefer explicit WEBHOOK_* vars, but keep backwards-compatible VALKEY_/REDIS_ envs.
+    REDIS_HOST = _env_str("WEBHOOK_REDIS_HOST")
+        or os.getenv("VALKEY_HOST")
+        or os.getenv("REDIS_HOST")
+        or "127.0.0.1",
+    REDIS_PORT = _env_num("WEBHOOK_REDIS_PORT")
+        or tonumber(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT"))
+        or 6379,
+    -- Optional explicit prefixes (rarely needed); defaults derive from PREFIX.
+    CALLBACK_PREFIX = _env_str("WEBHOOK_CALLBACK_PREFIX"),
+    METRICS_PREFIX = _env_str("WEBHOOK_METRICS_PREFIX"),
+    WEBSOCKET_PREFIX = _env_str("WEBHOOK_WEBSOCKET_PREFIX"),
+
+    -- Auth (optional). These can also be overridden from webhook_config.lua.
+    -- NOTE: Env var names remain WEBHOOK_API_KEYS / WEBHOOK_AUTH_EXEMPT.
+    -- Ergonomic module keys:
+    --   API_KEYS = {"k1", "k2"}
+    --   AUTH_API_KEYS = {"k3"}
+    --   AUTH_EXEMPT = {"_metrics", "_stats"}
+    API_KEYS = nil,
+    AUTH_API_KEYS = nil,
+    AUTH_EXEMPT = nil,
+    STATIC_API_KEYS = {},
+    AUTH_API_KEYS_ENV = os.getenv("WEBHOOK_API_KEYS"),
+    AUTH_EXEMPT_ENV = os.getenv("WEBHOOK_AUTH_EXEMPT") or "",
+}
+
+local ALLOWED_OVERRIDE_KEYS = {
+    PREFIX = true,
+    DEFAULT_CATEGORY = true,
+    DEFAULT_TTL = true,
+    MAX_BODY_SIZE = true,
+    TOTAL_PAYLOAD_LIMIT = true,
+    RECALC_INTERVAL = true,
+    REDIS_HOST = true,
+    REDIS_PORT = true,
+    CALLBACK_PREFIX = true,
+    METRICS_PREFIX = true,
+    WEBSOCKET_PREFIX = true,
+
+    API_KEYS = true,
+    AUTH_API_KEYS = true,
+    AUTH_EXEMPT = true,
+    STATIC_API_KEYS = true,
+    AUTH_API_KEYS_ENV = true,
+    AUTH_EXEMPT_ENV = true,
+}
+
+local function _apply_overrides(overrides)
+    if type(overrides) ~= "table" then
+        return
+    end
+    for k, v in pairs(overrides) do
+        if ALLOWED_OVERRIDE_KEYS[k] then
+            SETTINGS[k] = v
+        end
+    end
+end
+
+do
+    local module_name = _env_str("WEBHOOK_CONFIG_MODULE") or "webhook_config"
+    local ok, overrides = pcall(require, module_name)
+    if ok then
+        _apply_overrides(overrides)
+    end
+end
+
+SETTINGS.PREFIX = _normalize_prefix(SETTINGS.PREFIX)
+if SETTINGS.CALLBACK_PREFIX == nil or SETTINGS.CALLBACK_PREFIX == "" then
+    SETTINGS.CALLBACK_PREFIX = SETTINGS.PREFIX .. "callback:"
+end
+if SETTINGS.METRICS_PREFIX == nil or SETTINGS.METRICS_PREFIX == "" then
+    SETTINGS.METRICS_PREFIX = SETTINGS.PREFIX .. "metrics:"
+end
+if SETTINGS.WEBSOCKET_PREFIX == nil or SETTINGS.WEBSOCKET_PREFIX == "" then
+    SETTINGS.WEBSOCKET_PREFIX = SETTINGS.PREFIX .. "ws:"
+end
+
+local PREFIX = SETTINGS.PREFIX                     -- prefix for all keys
+local CALLBACK_PREFIX = SETTINGS.CALLBACK_PREFIX   -- prefix for callback URLs
+local METRICS_PREFIX = SETTINGS.METRICS_PREFIX     -- prefix for metrics
+local WEBSOCKET_PREFIX = SETTINGS.WEBSOCKET_PREFIX -- prefix for WebSocket subscriptions
+local DEFAULT_CATEGORY = SETTINGS.DEFAULT_CATEGORY -- fallback category
+local DEFAULT_TTL = SETTINGS.DEFAULT_TTL
+local MAX_BODY_SIZE = SETTINGS.MAX_BODY_SIZE
+local TOTAL_PAYLOAD_LIMIT = SETTINGS.TOTAL_PAYLOAD_LIMIT
 local TOTAL_SIZE_KEY = PREFIX .. "total_size"
 local LAST_RECALC_KEY = PREFIX .. "total_size_last_recalc"
-local RECALC_INTERVAL = 300                   -- seconds, 5 minutes
-local REDIS_HOST = os.getenv("VALKEY_HOST") or os.getenv("REDIS_HOST") or "127.0.0.1"
-local REDIS_PORT = tonumber(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT")) or 6379
+local RECALC_INTERVAL = SETTINGS.RECALC_INTERVAL
+local REDIS_HOST = SETTINGS.REDIS_HOST
+local REDIS_PORT = SETTINGS.REDIS_PORT
 
 -- ==== AUTHENTICATION (optional) ====
 -- Set one or more API keys to require auth on all endpoints.
@@ -25,9 +157,31 @@ local REDIS_PORT = tonumber(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT"))
 --
 -- Exempt endpoints (by the 2nd path segment, e.g. "_metrics") can be provided via:
 --   WEBHOOK_AUTH_EXEMPT="_metrics,_stats"
-local STATIC_API_KEYS = {}
-local AUTH_API_KEYS_ENV = os.getenv("WEBHOOK_API_KEYS")
-local AUTH_EXEMPT_ENV = os.getenv("WEBHOOK_AUTH_EXEMPT") or ""
+local function _coerce_string_list(v)
+    local out = {}
+    if type(v) ~= "table" then
+        return out
+    end
+    for _, item in ipairs(v) do
+        if type(item) == "string" and item ~= "" then
+            out[#out + 1] = item
+        end
+    end
+    return out
+end
+
+local STATIC_API_KEYS
+if type(SETTINGS.API_KEYS) == "table" then
+    -- Ergonomic: API_KEYS overrides legacy STATIC_API_KEYS.
+    STATIC_API_KEYS = _coerce_string_list(SETTINGS.API_KEYS)
+else
+    STATIC_API_KEYS = _coerce_string_list(SETTINGS.STATIC_API_KEYS)
+end
+
+local MODULE_AUTH_API_KEYS = _coerce_string_list(SETTINGS.AUTH_API_KEYS)
+local MODULE_AUTH_EXEMPT = _coerce_string_list(SETTINGS.AUTH_EXEMPT)
+local AUTH_API_KEYS_ENV = SETTINGS.AUTH_API_KEYS_ENV
+local AUTH_EXEMPT_ENV = SETTINGS.AUTH_EXEMPT_ENV or ""
 
 local function _trim(s)
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -54,12 +208,18 @@ local function _build_auth_state()
             table.insert(keys, k)
         end
     end
+    for _, k in ipairs(MODULE_AUTH_API_KEYS) do
+        table.insert(keys, k)
+    end
     for _, k in ipairs(_split_csv(AUTH_API_KEYS_ENV)) do
         table.insert(keys, k)
     end
 
     local exempt = {}
     for _, e in ipairs(_split_csv(AUTH_EXEMPT_ENV)) do
+        exempt[e] = true
+    end
+    for _, e in ipairs(MODULE_AUTH_EXEMPT) do
         exempt[e] = true
     end
 

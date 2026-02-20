@@ -9,7 +9,7 @@ COPY webhook.lua /usr/local/openresty/webhook.lua
 RUN mkdir -p /etc/nginx/conf.d /etc/nginx/includes \
     && rm -f /etc/nginx/conf.d/*.conf
 
-COPY nginx-example.conf /etc/nginx/includes/webhook-location.conf
+COPY examples/nginx-example.conf /etc/nginx/includes/webhook-location.conf
 
 # Update path in the included location config
 RUN sed -i 's|/path/to/webhook/webhook.lua|/usr/local/openresty/webhook.lua|' \
@@ -19,8 +19,9 @@ RUN sed -i 's|/path/to/webhook/webhook.lua|/usr/local/openresty/webhook.lua|' \
             'env REDIS_PORT;' \
             'env VALKEY_HOST;' \
             'env VALKEY_PORT;' \
-                        'env WEBHOOK_API_KEYS;' \
-                        'env WEBHOOK_AUTH_EXEMPT;' \
+            'env WEBHOOK_CONFIG_MODULE;' \
+            'env WEBHOOK_API_KEYS;' \
+            'env WEBHOOK_AUTH_EXEMPT;' \
             > /etc/nginx/conf.d/valkey-env.main \
     && printf '%s\n' \
       'server {' \

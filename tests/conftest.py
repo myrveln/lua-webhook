@@ -25,14 +25,23 @@ def wait_for_openresty() -> None:
     auth and no-auth modes.
     """
 
-    base_url = os.getenv("BASE_URL", "http://localhost:8080/webhook").rstrip("/")
+    base_urls = []
+    for env_name, default in (
+        ("BASE_URL", "http://localhost:8080/webhook"),
+        ("BASE_URL_CONFIG", ""),
+    ):
+        v = (os.getenv(env_name) or default).strip()
+        if v:
+            base_urls.append(v.rstrip("/"))
 
     # `_stats` is commonly exempted from auth; but even if it isn't, any HTTP
     # status code means the service is alive.
-    probe_urls = [
-        f"{base_url}/_stats",
-        base_url,
-    ]
+    probe_urls = []
+    for base_url in dict.fromkeys(base_urls):
+        probe_urls.extend([
+            f"{base_url}/_stats",
+            base_url,
+        ])
 
     deadline = time.monotonic() + float(os.getenv("WEBHOOK_TEST_STARTUP_TIMEOUT_S", "20"))
     sleep_s = 0.1
