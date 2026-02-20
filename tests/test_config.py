@@ -84,14 +84,12 @@ def _delete_keys(keys: list[str]) -> None:
 
 
 def test__delete_keys_empty_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    called = {"delete": False}
+    from unittest.mock import Mock
 
-    def _mark_called(*args, **kwargs):
-        called["delete"] = True
-
-    monkeypatch.setattr(requests, "delete", _mark_called)
+    mock_delete = Mock()
+    monkeypatch.setattr(requests, "delete", mock_delete)
     _delete_keys([])
-    assert called["delete"] is False
+    mock_delete.assert_not_called()
 
 
 def _compact_json(obj: dict) -> str:
