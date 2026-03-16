@@ -16,7 +16,9 @@ function M.apply(cfg)
     ngx.header["Access-Control-Expose-Headers"] = cfg.CORS_EXPOSE_HEADERS
     ngx.header["Access-Control-Max-Age"] = tostring(cfg.CORS_MAX_AGE_S)
 
-    if cfg.CORS_ALLOW_CREDENTIALS then
+    -- Per CORS spec, Access-Control-Allow-Credentials must not be set when
+    -- Access-Control-Allow-Origin is "*", or browsers will reject the response.
+    if cfg.CORS_ALLOW_CREDENTIALS and cfg.CORS_ALLOW_ORIGIN ~= "*" then
         ngx.header["Access-Control-Allow-Credentials"] = "true"
     end
 

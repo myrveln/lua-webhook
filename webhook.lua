@@ -111,16 +111,27 @@ local function _secure_equals(a, b)
     end
     local alen = #a
     local blen = #b
-    if alen ~= blen then
-        return false
+
+    -- Avoid early-return on length mismatch to reduce timing leakage.
+    -- Still returns false when lengths differ.
+    local max_len = alen
+    if blen > max_len then
+        max_len = blen
     end
-    if not bit then
-        return a == b
+
+    local diff = (alen == blen) and 0 or 1
+    for i = 1, max_len do
+        local abyte = (i <= alen) and a:byte(i) or 0
+        local bbyte = (i <= blen) and b:byte(i) or 0
+        if bit then
+            diff = bit.bor(diff, bit.bxor(abyte, bbyte))
+        else
+            if abyte ~= bbyte then
+                diff = 1
+            end
+        end
     end
-    local diff = 0
-    for i = 1, alen do
-        diff = bit.bor(diff, bit.bxor(a:byte(i), b:byte(i)))
-    end
+
     return diff == 0
 end
 
@@ -946,12 +957,12 @@ local function import_webhooks(red, import_data)
                 local created_at = webhook.created_at or iso8601_timestamp()
                 local key = PREFIX .. webhook.category .. ":" .. ngx.time() .. ":" .. idx .. ":" .. ngx.md5(payload_json)
 
-            local store_data = {
-                created_at = created_at,
-                category = webhook.category,
-                payload = webhook.payload,
-                size = #payload_json
-            }
+                local store_data = {
+                    created_at = created_at,
+                    category = webhook.category,
+                    payload = webhook.payload,
+                    size = #payload_json
+                }
 
                 local ok, err = red:set(key, cjson.encode(store_data), "EX", ttl)
                 if ok then
@@ -1238,6 +1249,7 @@ local function _ensure_indexes(red)
             and redis_key ~= LAST_RECALC_KEY
             and redis_key ~= INDEX_KEY
             and redis_key ~= CATEGORY_COUNT_KEY
+            and not string.match(redis_key, "^" .. INDEX_CAT_PREFIX)
             and not string.match(redis_key, "^" .. CALLBACK_PREFIX)
             and not string.match(redis_key, "^" .. METRICS_PREFIX)
             and not string.match(redis_key, "^" .. WEBSOCKET_PREFIX)
@@ -1324,9 +1336,6 @@ local function _is_private_ip_literal(host)
         return true
     end
     -- Hostname.
-    if h:lower():match("^localhost$") then
-        return true
-    end
     return false
 end
 
@@ -2321,25 +2330,25 @@ elseif method == "DELETE" then
                 table.insert(batch_results.not_found, key_to_delete)
                 batch_results.total_not_found = batch_results.total_not_found + 1
             else
-            local full_key = PREFIX .. key_to_delete
-            local val = red:get(full_key)
-            if val and val ~= ngx.null then
-                local decoded = cjson.decode(val)
-                if decoded and decoded.size then
-                    update_total_size(red, -decoded.size)
-                else
-                    update_total_size(red, -#val)
-                end
-                _index_remove(red, category, key_to_delete)
-                _del_callback_url(red, key_to_delete)
-                red:del(full_key)
+                local full_key = PREFIX .. key_to_delete
+                local val = red:get(full_key)
+                if val and val ~= ngx.null then
+                    local decoded = cjson.decode(val)
+                    if decoded and decoded.size then
+                        update_total_size(red, -decoded.size)
+                    else
+                        update_total_size(red, -#val)
+                    end
+                    _index_remove(red, category, key_to_delete)
+                    _del_callback_url(red, key_to_delete)
+                    red:del(full_key)
 
-                table.insert(batch_results.deleted, key_to_delete)
-                batch_results.total_deleted = batch_results.total_deleted + 1
-            else
-                table.insert(batch_results.not_found, key_to_delete)
-                batch_results.total_not_found = batch_results.total_not_found + 1
-            end
+                    table.insert(batch_results.deleted, key_to_delete)
+                    batch_results.total_deleted = batch_results.total_deleted + 1
+                else
+                    table.insert(batch_results.not_found, key_to_delete)
+                    batch_results.total_not_found = batch_results.total_not_found + 1
+                end
             end
         end
 
