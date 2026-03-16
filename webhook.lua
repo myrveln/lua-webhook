@@ -507,28 +507,31 @@ local function ttl_pipeline_chunked(red, keys, chunk_size)
 end
 
 local function send_json(status, tbl, headers)
+    local ctx_red = ngx.ctx and ngx.ctx.red
+    local metric_incrs
+
+    local function _queue_metric(name, value)
+        if not ctx_red then
+            return
+        end
+        if not metric_incrs then
+            metric_incrs = {}
+        end
+        metric_incrs[#metric_incrs + 1] = { name, value or 1 }
+    end
+
     -- Track errors centrally for all JSON responses with HTTP status >= 400.
     -- This keeps `webhook_errors_total` consistent across endpoints.
     if status and status >= 400 then
-        local ctx_red = ngx.ctx and ngx.ctx.red
-        if ctx_red then
-            pcall(function()
-                increment_metric(ctx_red, "errors_total")
-            end)
-        end
+        _queue_metric("errors_total", 1)
     end
 
     -- Generic response accounting
-    do
-        local ctx_red = ngx.ctx and ngx.ctx.red
-        if ctx_red and status then
-            pcall(function()
-                increment_metric(ctx_red, "responses_total")
-                increment_metric(ctx_red, "responses_status_" .. tostring(status))
-                local cls = math.floor(status / 100)
-                increment_metric(ctx_red, "responses_class_" .. tostring(cls) .. "xx")
-            end)
-        end
+    if status then
+        _queue_metric("responses_total", 1)
+        _queue_metric("responses_status_" .. tostring(status), 1)
+        local cls = math.floor(status / 100)
+        _queue_metric("responses_class_" .. tostring(cls) .. "xx", 1)
     end
 
     ngx.status = status
@@ -549,50 +552,49 @@ local function send_json(status, tbl, headers)
     end
 
     do
-        local ctx_red = ngx.ctx and ngx.ctx.red
-        if ctx_red then
-            local in_bytes = ngx.ctx and ngx.ctx.request_bytes_in
-            local out_bytes = ngx.ctx and ngx.ctx.response_bytes_out
-            pcall(function()
-                if in_bytes and in_bytes > 0 then
-                    increment_metric(ctx_red, "bytes_in_total", in_bytes)
-                    ngx.ctx.request_bytes_in = 0
-                end
-                if out_bytes and out_bytes > 0 then
-                    increment_metric(ctx_red, "bytes_out_total", out_bytes)
-                    ngx.ctx.response_bytes_out = 0
-                end
-            end)
+        local in_bytes = ngx.ctx and ngx.ctx.request_bytes_in
+        local out_bytes = ngx.ctx and ngx.ctx.response_bytes_out
+        if in_bytes and in_bytes > 0 then
+            _queue_metric("bytes_in_total", in_bytes)
+            ngx.ctx.request_bytes_in = 0
+        end
+        if out_bytes and out_bytes > 0 then
+            _queue_metric("bytes_out_total", out_bytes)
+            ngx.ctx.response_bytes_out = 0
         end
     end
 
     -- Latency metrics
     do
-        local ctx_red = ngx.ctx and ngx.ctx.red
         local started = ngx.ctx and ngx.ctx.request_start
-        if ctx_red and started then
+        if started then
             local elapsed_ms = math.floor((ngx.now() - started) * 1000)
-            pcall(function()
-                increment_metric(ctx_red, "latency_ms_sum", elapsed_ms)
-                increment_metric(ctx_red, "latency_ms_count", 1)
+            _queue_metric("latency_ms_sum", elapsed_ms)
+            _queue_metric("latency_ms_count", 1)
 
-                local buckets = { 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 }
-                for _, le in ipairs(buckets) do
-                    if elapsed_ms <= le then
-                        increment_metric(ctx_red, "latency_ms_bucket_le_" .. tostring(le), 1)
-                    end
+            local buckets = { 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 }
+            for _, le in ipairs(buckets) do
+                if elapsed_ms <= le then
+                    _queue_metric("latency_ms_bucket_le_" .. tostring(le), 1)
                 end
-                increment_metric(ctx_red, "latency_ms_bucket_le_inf", 1)
-            end)
+            end
+            _queue_metric("latency_ms_bucket_le_inf", 1)
         end
     end
 
-    ngx.say(encoded)
-    local red = ngx.ctx and ngx.ctx.red
-    if red then
-        _redis_put_back(red)
+    -- Pipeline metrics updates to minimize round trips.
+    if ctx_red and metric_incrs and #metric_incrs > 0 then
+        pcall(function()
+            ctx_red:init_pipeline()
+            for _, item in ipairs(metric_incrs) do
+                ctx_red:incrby(METRICS_PREFIX .. item[1], item[2])
+            end
+            ctx_red:commit_pipeline()
+        end)
     end
-    ngx.exit(status)
+
+    ngx.say(encoded)
+    return _finish(status)
 end
 
 local function iso8601_timestamp()
@@ -1216,10 +1218,38 @@ local function _ensure_indexes(red)
         return
     end
 
+    local lock_key = ready_key .. ":rebuild_lock"
+
+    -- Ensure only one worker performs a rebuild at a time.
+    local lock_ok = red:set(lock_key, "1", "NX", "EX", 120)
+    if not lock_ok then
+        -- Another worker is rebuilding; wait briefly for readiness.
+        for _ = 1, 50 do
+            ngx.sleep(0.05)
+            local r = red:get(ready_key)
+            if r and r ~= ngx.null and tostring(r) == "1" then
+                return
+            end
+        end
+        return
+    end
+
+    -- Re-check now that we hold the lock.
+    ready = red:get(ready_key)
+    if ready and ready ~= ngx.null and tostring(ready) == "1" then
+        pcall(function()
+            red:del(lock_key)
+        end)
+        return
+    end
+
     -- If indexes already have content, consider them ready.
     local n = red:zcard(INDEX_KEY)
     if n and tonumber(n) and tonumber(n) > 0 then
         red:set(ready_key, "1")
+        pcall(function()
+            red:del(lock_key)
+        end)
         return
     end
 
@@ -1227,6 +1257,9 @@ local function _ensure_indexes(red)
     local keys = scan_keys(red, PREFIX .. "*")
     if not keys or #keys == 0 then
         red:set(ready_key, "1")
+        pcall(function()
+            red:del(lock_key)
+        end)
         return
     end
 
@@ -1271,6 +1304,9 @@ local function _ensure_indexes(red)
     end
 
     red:set(ready_key, "1")
+    pcall(function()
+        red:del(lock_key)
+    end)
 end
 
 local function _rate_limit_key_for(identifier)
@@ -1312,6 +1348,9 @@ local function _is_private_ip_literal(host)
         b = tonumber(b)
         if not a or not b then
             return false
+        end
+        if a == 0 then
+            return true
         end
         if a == 10 then
             return true
@@ -1412,7 +1451,7 @@ local key_from_path = path_parts[3]
 if method == "OPTIONS" then
     _apply_cors_headers()
     ngx.status = 204
-    return ngx.exit(204)
+    return _finish(204)
 end
 
 -- Connect to Redis
@@ -1823,14 +1862,20 @@ elseif method == "GET" then
         if not pok then
             increment_metric(red, "ws_backend_errors_total")
             wb:send_close()
-            return ngx.exit(200)
+            pcall(function()
+                _redis_put_back(pub)
+            end)
+            return _finish(200)
         end
 
         local sres, serr = pub:subscribe("webhook:events")
         if not sres then
             increment_metric(red, "ws_backend_errors_total")
             wb:send_close()
-            return ngx.exit(200)
+            pcall(function()
+                _redis_put_back(pub)
+            end)
+            return _finish(200)
         end
 
         increment_metric(red, "ws_connected_total")
@@ -1898,8 +1943,7 @@ elseif method == "GET" then
         _apply_cors_headers()
         ngx.header.content_type = "text/plain; version=0.0.4"
         ngx.say(get_prometheus_metrics(red))
-        _redis_put_back(red)
-        return ngx.exit(200)
+        return _finish(200)
     end
 
     -- GET /webhook/_stats - return statistics
