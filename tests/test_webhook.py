@@ -10,10 +10,14 @@ import json
 import time
 from typing import Dict, Any
 import os
+import redis
 
 # Configuration
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8080/webhook")
 WEBHOOK_TEST_API_KEY = os.getenv("WEBHOOK_TEST_API_KEY", "")
+
+REDIS_HOST = os.getenv("WEBHOOK_REDIS_HOST") or "127.0.0.1"
+REDIS_PORT = int(os.getenv("WEBHOOK_REDIS_PORT") or "6379")
 
 
 def _with_auth_headers(headers: Dict[str, str] | None = None) -> Dict[str, str]:
@@ -43,6 +47,11 @@ def http_patch(url: str, **kwargs):
 def http_delete(url: str, **kwargs):
     kwargs["headers"] = _with_auth_headers(kwargs.get("headers"))
     return requests.delete(url, **kwargs)
+
+
+def http_options(url: str, **kwargs):
+    kwargs["headers"] = _with_auth_headers(kwargs.get("headers"))
+    return requests.options(url, **kwargs)
 
 
 class TestWebhookBasicOperations:
@@ -132,6 +141,46 @@ class TestWebhookBasicOperations:
         data = response.json()
         assert "keys" in data
 
+    def test_list_pagination_and_cursor(self):
+        """Listing supports limit+cursor pagination."""
+
+        # Create a handful of webhooks in one category.
+        for i in range(5):
+            r = http_post(f"{BASE_URL}/page", json={"n": i})
+            assert r.status_code == 200
+
+        first = http_get(f"{BASE_URL}/page?limit=2")
+        assert first.status_code == 200
+        d1 = first.json()
+        assert d1["count"] == 2
+        assert "next_cursor" in d1
+
+        c1 = d1.get("next_cursor")
+        assert c1 is not None
+        # Header is optional (present when next_cursor exists)
+        assert "X-Next-Cursor" in first.headers
+
+        keys1 = {item["key"] for item in d1["keys"]}
+
+        second = http_get(f"{BASE_URL}/page?limit=2&cursor={c1}")
+        assert second.status_code == 200
+        d2 = second.json()
+        assert d2["count"] == 2
+        keys2 = {item["key"] for item in d2["keys"]}
+
+        assert keys1.isdisjoint(keys2)
+
+    def test_list_include_payload_false(self):
+        r = http_post(f"{BASE_URL}/payload", json={"hello": "world"})
+        assert r.status_code == 200
+
+        resp = http_get(f"{BASE_URL}/payload?limit=1&include_payload=false")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        first = data["keys"][0]
+        assert "payload" not in first
+
     def test_delete_webhook(self):
         """Test deleting a webhook"""
         # Create webhook
@@ -189,15 +238,47 @@ class TestWebhookErrors:
 
     def test_key_not_found(self):
         """Test retrieving non-existent key"""
-        response = http_get(f"{BASE_URL}/test/nonexistent:key")
+        # Key must match category prefix under stricter validation.
+        response = http_get(f"{BASE_URL}/test/test:0:nonexistent")
 
         assert response.status_code == 404
         data = response.json()
         assert data["error_code"] == "KEY_NOT_FOUND"
 
+    def test_key_category_mismatch_is_400(self):
+        create = http_post(f"{BASE_URL}/cat-a", json={"x": 1})
+        assert create.status_code == 200
+        key = create.json()["key"]
+
+        # Same key, wrong category path.
+        resp = http_get(f"{BASE_URL}/cat-b/{key}")
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data.get("error_code") == "KEY_CATEGORY_MISMATCH"
+
+    def test_reserved_category_is_rejected(self):
+        resp = http_post(f"{BASE_URL}/_reserved", json={"x": 1})
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data.get("error_code") == "INVALID_CATEGORY"
+
+    def test_invalid_key_format_is_400(self):
+        # Whitespace/control characters are rejected.
+        resp = http_get(f"{BASE_URL}/test/test:0:bad%20key")
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data.get("error_code") == "INVALID_KEY"
+
+
+class TestWebhookCorsAndOptions:
+    def test_options_preflight(self):
+        resp = http_options(BASE_URL)
+        assert resp.status_code == 204
+
     def test_delete_nonexistent_key(self):
         """Test deleting non-existent key"""
-        response = http_delete(f"{BASE_URL}/test/nonexistent:key")
+        # Key must match category prefix under stricter validation.
+        response = http_delete(f"{BASE_URL}/test/test:0:nonexistent")
 
         assert response.status_code == 404
         data = response.json()
@@ -280,6 +361,35 @@ class TestWebhookAdvancedFeatures:
         assert data["count"] >= 1
         assert any("laptop" in str(r).lower() for r in data["results"])
 
+    def test_search_pagination_cursor(self):
+        # Create a couple of matching webhooks.
+        for i in range(3):
+            http_post(f"{BASE_URL}/search-page", json={"tag": "cursor-search", "i": i})
+
+        first = http_get(f"{BASE_URL}/_search?q=cursor-search&limit=1")
+        assert first.status_code == 200
+        d1 = first.json()
+        assert d1["count"] == 1
+        c1 = d1.get("next_cursor")
+        assert c1 is not None
+
+        key1 = d1["results"][0]["key"]
+
+        second = http_get(f"{BASE_URL}/_search?q=cursor-search&limit=1&cursor={c1}")
+        assert second.status_code == 200
+        d2 = second.json()
+        assert d2["count"] == 1
+        key2 = d2["results"][0]["key"]
+        assert key1 != key2
+
+    def test_search_include_payload_false(self):
+        http_post(f"{BASE_URL}/search-nopayload", json={"tag": "no-payload", "x": 1})
+        resp = http_get(f"{BASE_URL}/_search?q=no-payload&limit=5&include_payload=false")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] >= 1
+        assert "payload" not in data["results"][0]
+
     def test_statistics(self):
         """Test statistics endpoint"""
         response = http_get(f"{BASE_URL}/_stats")
@@ -331,6 +441,29 @@ class TestWebhookAdvancedFeatures:
         )
 
         assert remove_response.status_code == 200
+
+    def test_callback_url_validation_blocks_localhost(self):
+        # Create webhook
+        create_response = http_post(f"{BASE_URL}/test", json={"data": "cb-validate"})
+        assert create_response.status_code == 200
+        key = create_response.json()["key"]
+
+        # Attempt to set a localhost callback (blocked by default).
+        resp = http_patch(
+            f"{BASE_URL}/test/{key}",
+            json={"callback_url": "https://localhost/notify"},
+        )
+        assert resp.status_code == 400
+        assert resp.json().get("error_code") == "INVALID_CALLBACK_URL"
+
+    def test_callback_url_validation_blocks_http_scheme(self):
+        # Create webhook with callback_url in query string (http is blocked by default).
+        resp = http_post(
+            f"{BASE_URL}/test?callback_url=http://example.com/notify",
+            json={"data": "cb-http"},
+        )
+        assert resp.status_code == 400
+        assert resp.json().get("error_code") == "INVALID_CALLBACK_URL"
 
     def test_webhook_replay(self):
         """Test webhook replay functionality"""
@@ -419,6 +552,11 @@ class TestWebhookMetrics:
         assert "webhook_deleted_total" in metrics
         assert "webhook_storage_bytes" in metrics
         assert "webhook_count" in metrics
+        assert "webhook_responses_total" in metrics
+        assert "webhook_bytes_in_total" in metrics
+        assert "webhook_bytes_out_total" in metrics
+        assert "webhook_rate_limited_total" in metrics
+        assert "webhook_request_latency_ms_bucket" in metrics
 
         # Check Prometheus format
         assert "# HELP" in metrics
@@ -456,6 +594,36 @@ class TestWebhookLargePayloads:
         assert len(retrieved) >= 1000
         # Check first item structure
         assert "ID" in retrieved[0]["id"]
+
+
+class TestWebhookIndexRebuild:
+    def test_index_rebuild_recovers_listing(self):
+        # Create one webhook so there's something to rebuild.
+        create = http_post(f"{BASE_URL}/rebuild", json={"ok": True})
+        assert create.status_code == 200
+        created_key = create.json()["key"]
+
+        # Delete index keys to force a rebuild on the next request.
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        # Default prefix is webhook: in the docker-compose stack.
+        # If the service is configured with a different prefix, skip.
+        prefix = os.getenv("WEBHOOK_PREFIX") or "webhook:"
+        if prefix != "webhook:" and prefix != "webhook":
+            pytest.skip("Index rebuild test assumes default WEBHOOK_PREFIX")
+
+        r.delete(
+            "webhook:_index_ready",
+            "webhook:_index",
+            "webhook:_categories",
+            "webhook:_index:rebuild",
+        )
+
+        # Listing should still work (service will rebuild indexes lazily).
+        resp = http_get(f"{BASE_URL}/rebuild?limit=10")
+        assert resp.status_code == 200
+        data = resp.json()
+        keys = [item["key"] for item in data.get("keys", [])]
+        assert created_key in keys
 
 
 @pytest.fixture(scope="session", autouse=True)

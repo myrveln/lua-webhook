@@ -23,8 +23,8 @@ import requests
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8080/webhook")
 WEBHOOK_TEST_API_KEY = os.getenv("WEBHOOK_TEST_API_KEY", "")
 
-REDIS_HOST = os.getenv("VALKEY_HOST") or os.getenv("REDIS_HOST") or "127.0.0.1"
-REDIS_PORT = int(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT") or "6379")
+REDIS_HOST = os.getenv("WEBHOOK_REDIS_HOST") or "127.0.0.1"
+REDIS_PORT = int(os.getenv("WEBHOOK_REDIS_PORT") or "6379")
 
 
 def _auth_headers(headers: Dict[str, str] | None = None) -> Dict[str, str]:
