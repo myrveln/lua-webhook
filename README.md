@@ -2,7 +2,7 @@
 
 [![codecov](https://codecov.io/gh/myrveln/lua-webhook/branch/master/graph/badge.svg)](https://codecov.io/gh/myrveln/lua-webhook)
 
-A high-performance, RESTful webhook storage service built with OpenResty/Nginx and Lua, backed by Valkey. Store, retrieve, and manage webhook payloads with advanced features like batch operations, search, and expiry notifications.
+A high-performance, RESTful webhook storage service built with OpenResty/Nginx and Lua, backed by Valkey. Store, retrieve, and manage webhook payloads with advanced features like batch operations, search, and callback URL storage.
 
 ## Features
 
@@ -11,7 +11,7 @@ A high-performance, RESTful webhook storage service built with OpenResty/Nginx a
 - 🔍 **Full-Text Search** - Search across all webhook payloads
 - 📊 **Statistics** - Real-time storage and usage metrics
 - ⏰ **TTL Management** - Automatic expiration with configurable time-to-live
-- 🔔 **Callback URLs** - Register callbacks for expiry notifications
+- 🔔 **Callback URLs** - Store and manage callback URLs (for external workers/integrations)
 - 🏷️ **Categories** - Organize webhooks into categories
 - 🎯 **Query Filtering** - Filter webhooks by timestamp
 - 📝 **PATCH Support** - Update TTL and metadata without full replacement
@@ -46,14 +46,14 @@ luarocks install lua-webhook
 
 Note: OpenResty typically runs LuaJIT (Lua 5.1 compatible). Make sure your LuaRocks installation targets the same Lua/LuaJIT that OpenResty is using.
 
-This project is distributed as a single Lua file (`webhook.lua`). After installation, locate it so you can reference it from your Nginx/OpenResty config:
+The main entrypoint is the `webhook.lua` module, installed via LuaRocks along with internal helper modules (under `lua_webhook/`). After installation, locate the entrypoint so you can reference it from your Nginx/OpenResty config:
 
 ```bash
 # Prints the installed path to the module file (e.g. .../share/lua/5.1/webhook.lua)
 luarocks which webhook
 ```
 
-Then edit [examples/nginx-example.conf](examples/nginx-example.conf) to point at that file path (or copy the file into your preferred location and point Nginx/OpenResty at the copy).
+Then edit [examples/nginx-example.conf](examples/nginx-example.conf) to point at that file path. If you copy files out of the LuaRocks tree, copy both `webhook.lua` and the `lua_webhook/` directory (or ensure both remain available on `lua_package_path`).
 
 ### Configuration
 
@@ -63,9 +63,26 @@ If you installed via LuaRocks, avoid editing the installed `webhook.lua` directl
 
 Configure values like Redis/Valkey and defaults using env vars. In OpenResty, remember to allowlist env vars in `nginx.conf` (e.g. `env WEBHOOK_DEFAULT_TTL;`).
 
+Example:
+
+```bash
+# Key prefix for all Redis/Valkey keys (default: webhook:)
+WEBHOOK_PREFIX=webhook:
+
+# Defaults and limits
+WEBHOOK_DEFAULT_CATEGORY=default
+WEBHOOK_DEFAULT_TTL=259200
+WEBHOOK_MAX_BODY_SIZE=1048576
+WEBHOOK_TOTAL_PAYLOAD_LIMIT=52428800
+WEBHOOK_RECALC_INTERVAL=300
+
+WEBHOOK_REDIS_HOST=127.0.0.1
+WEBHOOK_REDIS_PORT=6379
+```
+
 Common variables:
 
-- `VALKEY_HOST` / `VALKEY_PORT` (or `REDIS_HOST` / `REDIS_PORT`)
+- `WEBHOOK_REDIS_HOST`, `WEBHOOK_REDIS_PORT`
 - `WEBHOOK_DEFAULT_CATEGORY`, `WEBHOOK_DEFAULT_TTL`, `WEBHOOK_MAX_BODY_SIZE`, `WEBHOOK_TOTAL_PAYLOAD_LIMIT`
 - `WEBHOOK_API_KEYS`, `WEBHOOK_AUTH_EXEMPT` (for auth)
 
@@ -146,6 +163,7 @@ GET /webhook/:category/:key
 ```http
 GET /webhook/:category
 GET /webhook/:category?since=1768418000
+GET /webhook/:category?limit=100&cursor=...&include_payload=false
 ```
 
 **Response:**
@@ -169,6 +187,12 @@ GET /webhook/:category?since=1768418000
 - `X-Total-Count`: Number of webhooks returned
 - `X-Storage-Used`: Current storage usage in bytes
 - `X-Storage-Limit`: Maximum storage limit in bytes
+- `X-Next-Cursor`: Cursor for the next page (when available)
+
+**Pagination query params:**
+- `limit`: Max items to return (default `WEBHOOK_DEFAULT_LIMIT`, max `WEBHOOK_MAX_LIMIT`)
+- `cursor`: Opaque numeric cursor returned as `next_cursor`/`X-Next-Cursor`
+- `include_payload=false`: Omits the `payload` field to reduce response size
 
 #### Update Webhook (TTL or Callback)
 ```http
@@ -182,6 +206,10 @@ PATCH /webhook/:category/:key
   "callback_url": "https://example.com/new-callback"
 }
 ```
+
+**Callback URL behavior:**
+- The service stores `callback_url` (and includes it in `GET` and export output), but it does not perform outbound HTTP delivery or expiry callbacks by itself.
+- This is intended for external workers/integrations that watch events (`webhook:events`) and act on stored metadata.
 
 #### Delete Webhook
 ```http
@@ -242,6 +270,7 @@ DELETE /webhook/:category/_batch
 #### Search Webhooks
 ```http
 GET /webhook/_search?q=searchterm
+GET /webhook/_search?q=searchterm&limit=100&cursor=...&include_payload=false
 ```
 
 **Response:**
@@ -260,6 +289,49 @@ GET /webhook/_search?q=searchterm
   ]
 }
 ```
+
+**Notes:**
+- Search is paginated via `limit` + `cursor` with `next_cursor`/`X-Next-Cursor`.
+- `include_payload=false` returns metadata only (no `payload`).
+
+## Validation & Compatibility
+
+- Categories starting with `_` are reserved for internal endpoints (like `_stats`, `_metrics`, `_ws`, `_search`, `_export`, `_import`).
+- For key-based operations (`GET/PATCH/DELETE /webhook/:category/:key`), the `:key` must match the `:category` prefix (i.e., `key` must start with `category:`).
+- Internal data prefixes (callbacks/metrics/ws) default to underscore variants (`_callback:`, `_metrics:`, `_ws:`) to avoid collisions with user categories.
+
+## Additional Configuration
+
+### Redis keepalive pooling
+
+- `WEBHOOK_REDIS_KEEPALIVE_TIMEOUT_MS` (default `60000`)
+- `WEBHOOK_REDIS_KEEPALIVE_POOL_SIZE` (default `100`, set to `0` to disable)
+
+### Rate limiting (optional)
+
+- `WEBHOOK_RATE_LIMIT_ENABLED` (`true`/`false`, default `false`)
+- `WEBHOOK_RATE_LIMIT_WINDOW_S` (default `60`)
+- `WEBHOOK_RATE_LIMIT_MAX_REQUESTS` (default `300`)
+- `WEBHOOK_RATE_LIMIT_EXEMPT` (CSV of endpoint categories, default `_stats`)
+
+### CORS (optional)
+
+Set `WEBHOOK_CORS_ALLOW_ORIGIN` to enable CORS (example: `*` or `https://your-ui.example`).
+
+- `WEBHOOK_CORS_ALLOW_ORIGIN`
+- `WEBHOOK_CORS_ALLOW_METHODS` (default `GET,POST,PATCH,DELETE,OPTIONS`)
+- `WEBHOOK_CORS_ALLOW_HEADERS` (default `Content-Type,Authorization,X-API-Key`)
+- `WEBHOOK_CORS_EXPOSE_HEADERS` (defaults include paging + storage headers)
+- `WEBHOOK_CORS_ALLOW_CREDENTIALS` (`true`/`false`)
+- `WEBHOOK_CORS_MAX_AGE_S` (default `600`)
+
+### Hashed API keys (optional)
+
+If you prefer not to store plaintext API keys in environment variables, you can provide SHA-256 hashes:
+
+- `WEBHOOK_API_KEY_HASHES` (comma-separated 64-char hex sha256 digests)
+
+The service will hash the presented key and compare to the allowlist.
 
 #### Get Statistics
 ```http
@@ -404,14 +476,21 @@ All errors include an `error_code` field for programmatic handling:
 
 - `NO_BODY` - Request body is missing
 - `INVALID_JSON` - Request body is not valid JSON
+- `INVALID_CATEGORY` - Category is invalid or reserved
+- `INVALID_KEY` - Key is invalid (format/length)
+- `KEY_CATEGORY_MISMATCH` - Key does not match the category in the URL path
 - `KEY_NOT_FOUND` - Requested webhook key doesn't exist
 - `MISSING_KEY` - Key required but not provided in path
 - `MISSING_QUERY` - Search query parameter missing
+- `INVALID_CALLBACK_URL` - Callback URL rejected by validation rules
 - `STORAGE_LIMIT_EXCEEDED` - Storage quota reached
 - `PAYLOAD_TOO_LARGE` - Single payload exceeds size limit
 - `INVALID_BATCH_FORMAT` - Batch request format is incorrect
 - `INVALID_ITEM_TYPE` - Batch item is not a JSON object
 - `METHOD_NOT_ALLOWED` - HTTP method not supported for endpoint
+- `RATE_LIMITED` - Request rejected by rate limiting
+- `AUTH_REQUIRED` - Missing API key when auth is enabled
+- `AUTH_INVALID` - Invalid API key when auth is enabled
 - `REDIS_ERROR` - Valkey operation failed
 
 ## Testing
@@ -627,17 +706,24 @@ scrape_configs:
 - `webhook_errors_total` - Total errors encountered (counter)
 - `webhook_auth_missing_total` - Requests missing an API key (counter)
 - `webhook_auth_invalid_total` - Requests with an invalid API key (counter)
+- `webhook_rate_limited_total` - Requests rejected by the built-in rate limiter (counter)
+- `webhook_bytes_in_total` - Request bytes received (counter)
+- `webhook_bytes_out_total` - Response bytes sent (counter)
+- `webhook_responses_total` - Total responses (counter)
+- `webhook_request_latency_ms_bucket` / `webhook_request_latency_ms_sum` / `webhook_request_latency_ms_count` - Latency histogram in milliseconds
 
 ## Security Considerations
 
 ⚠️ **Important**: This webhook service does not include built-in authentication by default. Before deploying to production:
 
 1. Implement authentication (API keys, OAuth, etc.)
-2. Add rate limiting (Nginx `limit_req` / `limit_conn` are the usual approach)
+2. Add rate limiting (Nginx `limit_req` / `limit_conn` are the usual approach; this service also supports an optional built-in rate limiter)
 3. Use HTTPS/TLS encryption
 4. Restrict access via firewall rules
 5. Monitor for abuse (Prometheus metrics are exposed at `/webhook/_metrics`)
 6. Consider using nginx's built-in security modules
+
+If you store `callback_url` values from untrusted clients, consider enabling a strict allowlist via `WEBHOOK_CALLBACK_URL_ALLOWLIST` and keeping private IP blocking enabled.
 
 ### API key authentication (optional)
 
