@@ -200,6 +200,12 @@ function M.load()
 
     settings.PREFIX = _normalize_prefix(settings.PREFIX)
 
+    -- Internal key prefixes.
+    -- These default to underscore-prefixed names to avoid collisions with user categories.
+    -- If you are upgrading an existing deployment and need to keep reading/writing under the
+    -- same internal key locations, set WEBHOOK_CALLBACK_PREFIX / WEBHOOK_METRICS_PREFIX /
+    -- WEBHOOK_WEBSOCKET_PREFIX explicitly.
+
     if settings.CALLBACK_PREFIX == nil or settings.CALLBACK_PREFIX == "" then
         settings.CALLBACK_PREFIX = settings.PREFIX .. "_callback:"
     end
