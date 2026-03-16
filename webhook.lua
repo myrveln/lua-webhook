@@ -13,6 +13,12 @@ local PREFIX = CFG.PREFIX                           -- prefix for all keys
 local CALLBACK_PREFIX = CFG.CALLBACK_PREFIX         -- prefix for callback URLs
 local METRICS_PREFIX = CFG.METRICS_PREFIX           -- prefix for metrics
 local WEBSOCKET_PREFIX = CFG.WEBSOCKET_PREFIX       -- prefix for WebSocket subscriptions
+
+-- Compatibility: previous versions used non-underscore internal key prefixes.
+-- Keep recognizing them to avoid mis-indexing and to preserve existing callback/metrics data.
+local CALLBACK_PREFIX_FALLBACK = PREFIX .. "callback:"
+local METRICS_PREFIX_FALLBACK = PREFIX .. "metrics:"
+local WEBSOCKET_PREFIX_FALLBACK = PREFIX .. "ws:"
 local DEFAULT_CATEGORY = CFG.DEFAULT_CATEGORY       -- fallback category
 local DEFAULT_TTL = CFG.DEFAULT_TTL
 local MAX_BODY_SIZE = CFG.MAX_BODY_SIZE
@@ -724,8 +730,11 @@ local function search_webhooks(red, query)
         local key_name = keys[i]
         if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
             and not string.match(key_name, "^" .. CALLBACK_PREFIX)
+            and not string.match(key_name, "^" .. CALLBACK_PREFIX_FALLBACK)
             and not string.match(key_name, "^" .. METRICS_PREFIX)
-            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
+            and not string.match(key_name, "^" .. METRICS_PREFIX_FALLBACK)
+            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX)
+            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX_FALLBACK) then
             if val and val ~= ngx.null then
                 local ok, decoded = pcall(cjson.decode, val)
                 if ok and type(decoded) == "table" then
@@ -761,7 +770,7 @@ local function get_prometheus_metrics(red)
                     local metric_name = string.gsub(key, "^" .. prefix, "")
                     local value = values[i]
                     if value and value ~= ngx.null then
-                        metrics[metric_name] = (tonumber(value) or 0)
+                        metrics[metric_name] = (metrics[metric_name] or 0) + (tonumber(value) or 0)
                     end
                 end
             end
@@ -769,6 +778,9 @@ local function get_prometheus_metrics(red)
     end
 
     _load(METRICS_PREFIX)
+    if METRICS_PREFIX_FALLBACK ~= METRICS_PREFIX then
+        _load(METRICS_PREFIX_FALLBACK)
+    end
 
     -- Get current stats
     local stats = get_stats(red)
@@ -1017,15 +1029,6 @@ local function publish_websocket_event(red, event_type, data)
     red:publish("webhook:events", cjson.encode(event))
 end
 
-local function _is_internal_endpoint(category)
-    return category == "_stats"
-        or category == "_metrics"
-        or category == "_search"
-        or category == "_export"
-        or category == "_import"
-        or category == "_ws"
-end
-
 local function _validate_category(category)
     if not category or category == "" then
         return false, "Category is required"
@@ -1082,12 +1085,25 @@ _get_callback_url = function(red, webhook_key)
     if v and v ~= ngx.null then
         return v
     end
+
+    local k_old = CALLBACK_PREFIX_FALLBACK .. webhook_key
+    if k_old ~= k_new then
+        local v_old = red:get(k_old)
+        if v_old and v_old ~= ngx.null then
+            return v_old
+        end
+    end
     return nil
 end
 
 _del_callback_url = function(red, webhook_key)
     local k_new = CALLBACK_PREFIX .. webhook_key
     red:del(k_new)
+
+    local k_old = CALLBACK_PREFIX_FALLBACK .. webhook_key
+    if k_old ~= k_new then
+        red:del(k_old)
+    end
 end
 
 _set_callback_url = function(red, webhook_key, callback_url, ttl)
@@ -1222,7 +1238,7 @@ local function _ensure_indexes(red)
 
     -- Ensure only one worker performs a rebuild at a time.
     local lock_ok = red:set(lock_key, "1", "NX", "EX", 120)
-    if not lock_ok then
+    if not lock_ok or lock_ok == ngx.null then
         -- Another worker is rebuilding; wait briefly for readiness.
         for _ = 1, 50 do
             ngx.sleep(0.05)
@@ -1284,8 +1300,11 @@ local function _ensure_indexes(red)
             and redis_key ~= CATEGORY_COUNT_KEY
             and not string.match(redis_key, "^" .. INDEX_CAT_PREFIX)
             and not string.match(redis_key, "^" .. CALLBACK_PREFIX)
+            and not string.match(redis_key, "^" .. CALLBACK_PREFIX_FALLBACK)
             and not string.match(redis_key, "^" .. METRICS_PREFIX)
+            and not string.match(redis_key, "^" .. METRICS_PREFIX_FALLBACK)
             and not string.match(redis_key, "^" .. WEBSOCKET_PREFIX)
+            and not string.match(redis_key, "^" .. WEBSOCKET_PREFIX_FALLBACK)
             and not string.match(redis_key, "^" .. RATE_LIMIT_PREFIX) then
 
             local webhook_key = string.gsub(redis_key, "^" .. PREFIX, "")
@@ -2290,6 +2309,11 @@ elseif method == "PATCH" then
             local k_new = CALLBACK_PREFIX .. key_from_path
             if red:exists(k_new) == 1 then
                 red:expire(k_new, new_ttl)
+            end
+
+            local k_old = CALLBACK_PREFIX_FALLBACK .. key_from_path
+            if k_old ~= k_new and red:exists(k_old) == 1 then
+                red:expire(k_old, new_ttl)
             end
         end
     end

@@ -86,6 +86,14 @@ Common variables:
 - `WEBHOOK_DEFAULT_CATEGORY`, `WEBHOOK_DEFAULT_TTL`, `WEBHOOK_MAX_BODY_SIZE`, `WEBHOOK_TOTAL_PAYLOAD_LIMIT`
 - `WEBHOOK_API_KEYS`, `WEBHOOK_AUTH_EXEMPT` (for auth)
 
+Advanced (internal key prefixes):
+
+- `WEBHOOK_CALLBACK_PREFIX` (default: `${WEBHOOK_PREFIX}_callback:`)
+- `WEBHOOK_METRICS_PREFIX` (default: `${WEBHOOK_PREFIX}_metrics:`)
+- `WEBHOOK_WEBSOCKET_PREFIX` (default: `${WEBHOOK_PREFIX}_ws:`)
+
+Upgrade note: older versions used `${WEBHOOK_PREFIX}callback:`, `${WEBHOOK_PREFIX}metrics:`, `${WEBHOOK_PREFIX}ws:`. This release uses underscore-prefixed defaults to avoid collisions with user categories. The service still recognizes the older defaults for reading callbacks/metrics, but you can set the env vars above to force a specific prefix during migration.
+
 **Option B: Local override module**
 
 Create a `webhook_config.lua` file somewhere stable (e.g. `/etc/openresty/lua/webhook_config.lua`) and add that directory to `lua_package_path`. The module should return a Lua table (see [examples/webhook_config.lua](examples/webhook_config.lua)):
