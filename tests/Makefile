@@ -1,10 +1,3 @@
-SHELL := /bin/bash
-
-.ONESHELL:
-.SHELLFLAGS := -euo pipefail -c
-
-SHELL=/bin/sh
-
 # Portable local + CI test runner.
 # Usage (from ./tests):
 #   make test all

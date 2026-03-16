@@ -97,7 +97,7 @@ jobs:
       if: always()
       run: |
         cd tests
-        coverage xml -o coverage.xml
+        .venv/bin/python -m coverage xml -o coverage.xml
 
     - name: Coverage summary
       if: always()
