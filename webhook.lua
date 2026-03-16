@@ -2,152 +2,55 @@ local cjson = require "cjson.safe"
 cjson.encode_escape_forward_slash(false)
 local redis = require "resty.redis"
 
--- ==== SETTINGS ====
--- IMPORTANT: Avoid editing this file directly when installed via LuaRocks.
--- Instead, override settings via environment variables and/or a local module.
---
--- Environment overrides (examples):
---   WEBHOOK_PREFIX=webhook:
---   WEBHOOK_DEFAULT_CATEGORY=default
---   WEBHOOK_DEFAULT_TTL=259200
---   WEBHOOK_MAX_BODY_SIZE=1048576
---   WEBHOOK_TOTAL_PAYLOAD_LIMIT=52428800
---   WEBHOOK_RECALC_INTERVAL=300
---   WEBHOOK_REDIS_HOST=127.0.0.1
---   WEBHOOK_REDIS_PORT=6379
---
--- Local module override (optional):
---   Create a `webhook_config.lua` in your `lua_package_path` that returns a table
---   with any of the keys below (e.g. { DEFAULT_TTL = 86400 }).
+local settings = require "lua_webhook.settings"
+local cors = require "lua_webhook.cors"
+local redis_client = require "lua_webhook.redis_client"
 
-local function _env_str(name)
-    local v = os.getenv(name)
-    if v and v ~= "" then
-        return v
-    end
-    return nil
-end
+local CFG = settings.load()
+local SETTINGS = CFG.SETTINGS
 
-local function _env_num(name)
-    local v = _env_str(name)
-    if not v then
-        return nil
-    end
-    local n = tonumber(v)
-    if n == nil then
-        return nil
-    end
-    return n
-end
+local PREFIX = CFG.PREFIX                           -- prefix for all keys
+local CALLBACK_PREFIX = CFG.CALLBACK_PREFIX         -- prefix for callback URLs
+local METRICS_PREFIX = CFG.METRICS_PREFIX           -- prefix for metrics
+local WEBSOCKET_PREFIX = CFG.WEBSOCKET_PREFIX       -- prefix for WebSocket subscriptions
 
-local function _normalize_prefix(prefix)
-    if not prefix or prefix == "" then
-        return "webhook:"
-    end
-    if prefix:sub(-1) ~= ":" then
-        return prefix .. ":"
-    end
-    return prefix
-end
+-- Compatibility: previous versions used non-underscore internal key prefixes.
+-- Keep recognizing them to avoid mis-indexing and to preserve existing callback/metrics data.
+local CALLBACK_PREFIX_FALLBACK = PREFIX .. "callback:"
+local METRICS_PREFIX_FALLBACK = PREFIX .. "metrics:"
+local WEBSOCKET_PREFIX_FALLBACK = PREFIX .. "ws:"
+local DEFAULT_CATEGORY = CFG.DEFAULT_CATEGORY       -- fallback category
+local DEFAULT_TTL = CFG.DEFAULT_TTL
+local MAX_BODY_SIZE = CFG.MAX_BODY_SIZE
+local TOTAL_PAYLOAD_LIMIT = CFG.TOTAL_PAYLOAD_LIMIT
+local TOTAL_SIZE_KEY = CFG.TOTAL_SIZE_KEY
+local LAST_RECALC_KEY = CFG.LAST_RECALC_KEY
 
-local SETTINGS = {
-    PREFIX = _normalize_prefix(_env_str("WEBHOOK_PREFIX") or "webhook:"),
-    DEFAULT_CATEGORY = _env_str("WEBHOOK_DEFAULT_CATEGORY") or "default",
-    DEFAULT_TTL = _env_num("WEBHOOK_DEFAULT_TTL") or 259200, -- 3 days
-    MAX_BODY_SIZE = _env_num("WEBHOOK_MAX_BODY_SIZE") or (1024 * 1024), -- 1 MB
-    TOTAL_PAYLOAD_LIMIT = _env_num("WEBHOOK_TOTAL_PAYLOAD_LIMIT") or (50 * 1024 * 1024), -- 50 MB
-    RECALC_INTERVAL = _env_num("WEBHOOK_RECALC_INTERVAL") or 300, -- seconds
-    -- Prefer explicit WEBHOOK_* vars, but keep backwards-compatible VALKEY_/REDIS_ envs.
-    REDIS_HOST = _env_str("WEBHOOK_REDIS_HOST")
-        or os.getenv("VALKEY_HOST")
-        or os.getenv("REDIS_HOST")
-        or "127.0.0.1",
-    REDIS_PORT = _env_num("WEBHOOK_REDIS_PORT")
-        or tonumber(os.getenv("VALKEY_PORT") or os.getenv("REDIS_PORT"))
-        or 6379,
-    -- Optional explicit prefixes (rarely needed); defaults derive from PREFIX.
-    CALLBACK_PREFIX = _env_str("WEBHOOK_CALLBACK_PREFIX"),
-    METRICS_PREFIX = _env_str("WEBHOOK_METRICS_PREFIX"),
-    WEBSOCKET_PREFIX = _env_str("WEBHOOK_WEBSOCKET_PREFIX"),
+-- Indexes for scalable listing/searching.
+local INDEX_KEY = CFG.INDEX_KEY
+local INDEX_CAT_PREFIX = CFG.INDEX_CAT_PREFIX
+local CATEGORY_COUNT_KEY = CFG.CATEGORY_COUNT_KEY
 
-    -- Auth (optional). These can also be overridden from webhook_config.lua.
-    -- NOTE: Env var names remain WEBHOOK_API_KEYS / WEBHOOK_AUTH_EXEMPT.
-    -- Ergonomic module keys:
-    --   API_KEYS = {"k1", "k2"}
-    --   AUTH_API_KEYS = {"k3"}
-    --   AUTH_EXEMPT = {"_metrics", "_stats"}
-    API_KEYS = nil,
-    AUTH_API_KEYS = nil,
-    AUTH_EXEMPT = nil,
-    STATIC_API_KEYS = {},
-    AUTH_API_KEYS_ENV = os.getenv("WEBHOOK_API_KEYS"),
-    AUTH_EXEMPT_ENV = os.getenv("WEBHOOK_AUTH_EXEMPT") or "",
-}
+-- Rate limiting keys.
+local RATE_LIMIT_PREFIX = CFG.RATE_LIMIT_PREFIX
+local RECALC_INTERVAL = CFG.RECALC_INTERVAL
+local REDIS_HOST = CFG.REDIS_HOST
+local REDIS_PORT = CFG.REDIS_PORT
 
-local ALLOWED_OVERRIDE_KEYS = {
-    PREFIX = true,
-    DEFAULT_CATEGORY = true,
-    DEFAULT_TTL = true,
-    MAX_BODY_SIZE = true,
-    TOTAL_PAYLOAD_LIMIT = true,
-    RECALC_INTERVAL = true,
-    REDIS_HOST = true,
-    REDIS_PORT = true,
-    CALLBACK_PREFIX = true,
-    METRICS_PREFIX = true,
-    WEBSOCKET_PREFIX = true,
+local REDIS_KEEPALIVE_TIMEOUT_MS = CFG.REDIS_KEEPALIVE_TIMEOUT_MS
+local REDIS_KEEPALIVE_POOL_SIZE = CFG.REDIS_KEEPALIVE_POOL_SIZE
 
-    API_KEYS = true,
-    AUTH_API_KEYS = true,
-    AUTH_EXEMPT = true,
-    STATIC_API_KEYS = true,
-    AUTH_API_KEYS_ENV = true,
-    AUTH_EXEMPT_ENV = true,
-}
+local DEFAULT_LIMIT = CFG.DEFAULT_LIMIT
+local MAX_LIMIT = CFG.MAX_LIMIT
+local SEARCH_MAX_CANDIDATES = CFG.SEARCH_MAX_CANDIDATES
 
-local function _apply_overrides(overrides)
-    if type(overrides) ~= "table" then
-        return
-    end
-    for k, v in pairs(overrides) do
-        if ALLOWED_OVERRIDE_KEYS[k] then
-            SETTINGS[k] = v
-        end
-    end
-end
+local RATE_LIMIT_ENABLED = CFG.RATE_LIMIT_ENABLED
+local RATE_LIMIT_WINDOW_S = CFG.RATE_LIMIT_WINDOW_S
+local RATE_LIMIT_MAX_REQUESTS = CFG.RATE_LIMIT_MAX_REQUESTS
 
-do
-    local module_name = _env_str("WEBHOOK_CONFIG_MODULE") or "webhook_config"
-    local ok, overrides = pcall(require, module_name)
-    if ok then
-        _apply_overrides(overrides)
-    end
-end
-
-SETTINGS.PREFIX = _normalize_prefix(SETTINGS.PREFIX)
-if SETTINGS.CALLBACK_PREFIX == nil or SETTINGS.CALLBACK_PREFIX == "" then
-    SETTINGS.CALLBACK_PREFIX = SETTINGS.PREFIX .. "callback:"
-end
-if SETTINGS.METRICS_PREFIX == nil or SETTINGS.METRICS_PREFIX == "" then
-    SETTINGS.METRICS_PREFIX = SETTINGS.PREFIX .. "metrics:"
-end
-if SETTINGS.WEBSOCKET_PREFIX == nil or SETTINGS.WEBSOCKET_PREFIX == "" then
-    SETTINGS.WEBSOCKET_PREFIX = SETTINGS.PREFIX .. "ws:"
-end
-
-local PREFIX = SETTINGS.PREFIX                     -- prefix for all keys
-local CALLBACK_PREFIX = SETTINGS.CALLBACK_PREFIX   -- prefix for callback URLs
-local METRICS_PREFIX = SETTINGS.METRICS_PREFIX     -- prefix for metrics
-local WEBSOCKET_PREFIX = SETTINGS.WEBSOCKET_PREFIX -- prefix for WebSocket subscriptions
-local DEFAULT_CATEGORY = SETTINGS.DEFAULT_CATEGORY -- fallback category
-local DEFAULT_TTL = SETTINGS.DEFAULT_TTL
-local MAX_BODY_SIZE = SETTINGS.MAX_BODY_SIZE
-local TOTAL_PAYLOAD_LIMIT = SETTINGS.TOTAL_PAYLOAD_LIMIT
-local TOTAL_SIZE_KEY = PREFIX .. "total_size"
-local LAST_RECALC_KEY = PREFIX .. "total_size_last_recalc"
-local RECALC_INTERVAL = SETTINGS.RECALC_INTERVAL
-local REDIS_HOST = SETTINGS.REDIS_HOST
-local REDIS_PORT = SETTINGS.REDIS_PORT
+local CALLBACK_URL_MAX_LEN = CFG.CALLBACK_URL_MAX_LEN
+local CALLBACK_URL_ALLOW_HTTP = CFG.CALLBACK_URL_ALLOW_HTTP
+local CALLBACK_URL_BLOCK_PRIVATE_IPS = CFG.CALLBACK_URL_BLOCK_PRIVATE_IPS
 
 -- ==== AUTHENTICATION (optional) ====
 -- Set one or more API keys to require auth on all endpoints.
@@ -172,7 +75,7 @@ end
 
 local STATIC_API_KEYS
 if type(SETTINGS.API_KEYS) == "table" then
-    -- Ergonomic: API_KEYS overrides legacy STATIC_API_KEYS.
+    -- Ergonomic: API_KEYS overrides STATIC_API_KEYS.
     STATIC_API_KEYS = _coerce_string_list(SETTINGS.API_KEYS)
 else
     STATIC_API_KEYS = _coerce_string_list(SETTINGS.STATIC_API_KEYS)
@@ -201,6 +104,61 @@ local function _split_csv(s)
     return out
 end
 
+local function _secure_equals(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then
+        return false
+    end
+    local alen = #a
+    local blen = #b
+
+    -- Avoid early-return on length mismatch to reduce timing leakage.
+    -- Still returns false when lengths differ.
+    local max_len = alen
+    if blen > max_len then
+        max_len = blen
+    end
+
+    local diff = (alen == blen) and 0 or 1
+    for i = 1, max_len do
+        local abyte = (i <= alen) and a:byte(i) or 0
+        local bbyte = (i <= blen) and b:byte(i) or 0
+        if bit then
+            diff = bit.bor(diff, bit.bxor(abyte, bbyte))
+        else
+            if abyte ~= bbyte then
+                diff = 1
+            end
+        end
+    end
+
+    return diff == 0
+end
+
+local function _normalize_hex_sha256(s)
+    if type(s) ~= "string" then
+        return nil
+    end
+    local v = _trim(s):lower()
+    if v:match("^[0-9a-f]+$") and #v == 64 then
+        return v
+    end
+    return nil
+end
+
+local function _coerce_sha256_hash_list(v)
+    local out = {}
+    if type(v) ~= "table" then
+        return out
+    end
+    for _, item in ipairs(v) do
+        local n = _normalize_hex_sha256(item)
+        if n then
+            out[#out + 1] = n
+        end
+    end
+    return out
+end
+
 local function _build_auth_state()
     local keys = {}
     for _, k in ipairs(STATIC_API_KEYS) do
@@ -215,6 +173,27 @@ local function _build_auth_state()
         table.insert(keys, k)
     end
 
+    local hashes = {}
+    local module_hashes
+    if type(SETTINGS.API_KEY_HASHES) == "table" then
+        module_hashes = _coerce_sha256_hash_list(SETTINGS.API_KEY_HASHES)
+    else
+        module_hashes = {}
+    end
+    local module_auth_hashes = _coerce_sha256_hash_list(SETTINGS.AUTH_API_KEY_HASHES)
+    for _, h in ipairs(module_hashes) do
+        hashes[#hashes + 1] = h
+    end
+    for _, h in ipairs(module_auth_hashes) do
+        hashes[#hashes + 1] = h
+    end
+    for _, h in ipairs(_split_csv(SETTINGS.AUTH_API_KEY_HASHES_ENV)) do
+        local n = _normalize_hex_sha256(h)
+        if n then
+            hashes[#hashes + 1] = n
+        end
+    end
+
     local exempt = {}
     for _, e in ipairs(_split_csv(AUTH_EXEMPT_ENV)) do
         exempt[e] = true
@@ -223,11 +202,41 @@ local function _build_auth_state()
         exempt[e] = true
     end
 
-    return keys, exempt
+    return keys, hashes, exempt
 end
 
-local API_KEYS, AUTH_EXEMPT = _build_auth_state()
-local AUTH_ENABLED = (#API_KEYS > 0)
+local API_KEYS, API_KEY_HASHES, AUTH_EXEMPT = _build_auth_state()
+local AUTH_ENABLED = (#API_KEYS > 0) or (#API_KEY_HASHES > 0)
+
+local function _build_rate_limit_exempt_state()
+    local exempt = {}
+    for _, e in ipairs(_split_csv(SETTINGS.RATE_LIMIT_EXEMPT_ENV or "")) do
+        exempt[e] = true
+    end
+    for _, e in ipairs(_coerce_string_list(SETTINGS.RATE_LIMIT_EXEMPT)) do
+        exempt[e] = true
+    end
+    return exempt
+end
+
+local RATE_LIMIT_EXEMPT = _build_rate_limit_exempt_state()
+
+local function _build_callback_allowlist_state()
+    local allow = {}
+    for _, h in ipairs(_split_csv(SETTINGS.CALLBACK_URL_ALLOWLIST_ENV or "")) do
+        if h and h ~= "" then
+            allow[h:lower()] = true
+        end
+    end
+    for _, h in ipairs(_coerce_string_list(SETTINGS.CALLBACK_URL_ALLOWLIST)) do
+        if h and h ~= "" then
+            allow[h:lower()] = true
+        end
+    end
+    return allow
+end
+
+local CALLBACK_URL_ALLOWLIST_STATE = _build_callback_allowlist_state()
 
 local function _get_presented_api_key()
     local headers = ngx.req.get_headers()
@@ -251,13 +260,43 @@ local function _api_key_is_valid(presented)
     if not presented or presented == "" then
         return false
     end
+
     for _, allowed in ipairs(API_KEYS) do
-        if presented == allowed then
+        if _secure_equals(presented, allowed) then
             return true
         end
     end
+
+    if #API_KEY_HASHES > 0 then
+        local ok_sha, sha256 = pcall(require, "resty.sha256")
+        local ok_str, str = pcall(require, "resty.string")
+        if not ok_sha or not ok_str then
+            -- Misconfiguration: hashes were provided but hashing libs are unavailable.
+            return false
+        end
+        local h = sha256:new()
+        h:update(presented)
+        local digest = str.to_hex(h:final()):lower()
+        for _, allowed_hash in ipairs(API_KEY_HASHES) do
+            if _secure_equals(digest, allowed_hash) then
+                return true
+            end
+        end
+    end
+
     return false
 end
+
+-- Forward declarations for helpers referenced by earlier-defined functions.
+-- In Lua, if a local isn't declared before use, it becomes a global reference.
+local _parse_key_timestamp
+local _index_key_for_category
+local _index_add
+local _index_remove
+local _get_callback_url
+local _set_callback_url
+local _del_callback_url
+local _validate_callback_url
 
 -- ==== UTILS ====
 local function read_request_body()
@@ -274,7 +313,77 @@ local function read_request_body()
             file:close()
         end
     end
+
+    if data and ngx.ctx then
+        ngx.ctx.request_bytes_in = (ngx.ctx.request_bytes_in or 0) + #data
+    end
     return data
+end
+
+local function _clamp(n, lo, hi)
+    if n == nil then
+        return lo
+    end
+    if n < lo then
+        return lo
+    end
+    if n > hi then
+        return hi
+    end
+    return n
+end
+
+local function _parse_limit(args)
+    local limit = tonumber(args and args.limit)
+    if not limit then
+        limit = DEFAULT_LIMIT
+    end
+    return _clamp(math.floor(limit), 1, MAX_LIMIT)
+end
+
+local function _parse_cursor(args)
+    local cursor = args and args.cursor
+    if cursor == nil or cursor == "" then
+        return nil
+    end
+    local n = tonumber(cursor)
+    if n then
+        return n
+    end
+    return nil
+end
+
+local function _parse_include_payload(args)
+    local v = args and (args.include_payload or args.includePayload)
+    if v == nil then
+        return true
+    end
+    if v == true or v == 1 then
+        return true
+    end
+    if type(v) == "string" then
+        local s = v:lower()
+        if s == "false" or s == "0" or s == "no" then
+            return false
+        end
+    end
+    return true
+end
+
+local function _apply_cors_headers()
+    return cors.apply(CFG)
+end
+
+local function _redis_put_back(red)
+    return redis_client.put_back(CFG, red)
+end
+
+local function _finish(status)
+    local red = ngx.ctx and ngx.ctx.red
+    if red then
+        _redis_put_back(red)
+    end
+    ngx.exit(status)
 end
 
 local function increment_metric(red, metric_name, value)
@@ -339,6 +448,35 @@ local function scan_keys(red, pattern, count)
     return out
 end
 
+local function zscan_members(red, zkey, count)
+    count = count or 1000
+    local cursor = "0"
+    local out = {}
+
+    while true do
+        local res, err = red:zscan(zkey, cursor, "COUNT", count)
+        if not res then
+            return nil, err
+        end
+        cursor = res[1]
+        local batch = res[2]
+        if batch and type(batch) == "table" then
+            local i = 1
+            while i <= #batch do
+                local member = batch[i]
+                out[#out + 1] = member
+                i = i + 2
+            end
+        end
+
+        if cursor == "0" or cursor == 0 then
+            break
+        end
+    end
+
+    return out
+end
+
 local function ttl_pipeline_chunked(red, keys, chunk_size)
     if not keys or #keys == 0 then
         return {}
@@ -368,19 +506,37 @@ local function ttl_pipeline_chunked(red, keys, chunk_size)
 end
 
 local function send_json(status, tbl, headers)
+    local ctx_red = ngx.ctx and ngx.ctx.red
+    local metric_incrs
+
+    local function _queue_metric(name, value)
+        if not ctx_red then
+            return
+        end
+        if not metric_incrs then
+            metric_incrs = {}
+        end
+        metric_incrs[#metric_incrs + 1] = { name, value or 1 }
+    end
+
     -- Track errors centrally for all JSON responses with HTTP status >= 400.
     -- This keeps `webhook_errors_total` consistent across endpoints.
     if status and status >= 400 then
-        local ctx_red = ngx.ctx and ngx.ctx.red
-        if ctx_red then
-            pcall(function()
-                increment_metric(ctx_red, "errors_total")
-            end)
-        end
+        _queue_metric("errors_total", 1)
+    end
+
+    -- Generic response accounting
+    if status then
+        _queue_metric("responses_total", 1)
+        _queue_metric("responses_status_" .. tostring(status), 1)
+        local cls = math.floor(status / 100)
+        _queue_metric("responses_class_" .. tostring(cls) .. "xx", 1)
     end
 
     ngx.status = status
     ngx.header.content_type = "application/json"
+
+    _apply_cors_headers()
 
     -- Add custom headers if provided
     if headers then
@@ -389,8 +545,55 @@ local function send_json(status, tbl, headers)
         end
     end
 
-    ngx.say(cjson.encode(tbl))
-    ngx.exit(status)
+    local encoded = cjson.encode(tbl)
+    if ngx.ctx then
+        ngx.ctx.response_bytes_out = (ngx.ctx.response_bytes_out or 0) + #encoded + 1
+    end
+
+    do
+        local in_bytes = ngx.ctx and ngx.ctx.request_bytes_in
+        local out_bytes = ngx.ctx and ngx.ctx.response_bytes_out
+        if in_bytes and in_bytes > 0 then
+            _queue_metric("bytes_in_total", in_bytes)
+            ngx.ctx.request_bytes_in = 0
+        end
+        if out_bytes and out_bytes > 0 then
+            _queue_metric("bytes_out_total", out_bytes)
+            ngx.ctx.response_bytes_out = 0
+        end
+    end
+
+    -- Latency metrics
+    do
+        local started = ngx.ctx and ngx.ctx.request_start
+        if started then
+            local elapsed_ms = math.floor((ngx.now() - started) * 1000)
+            _queue_metric("latency_ms_sum", elapsed_ms)
+            _queue_metric("latency_ms_count", 1)
+
+            local buckets = { 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 }
+            for _, le in ipairs(buckets) do
+                if elapsed_ms <= le then
+                    _queue_metric("latency_ms_bucket_le_" .. tostring(le), 1)
+                end
+            end
+            _queue_metric("latency_ms_bucket_le_inf", 1)
+        end
+    end
+
+    -- Pipeline metrics updates to minimize round trips.
+    if ctx_red and metric_incrs and #metric_incrs > 0 then
+        pcall(function()
+            ctx_red:init_pipeline()
+            for _, item in ipairs(metric_incrs) do
+                ctx_red:incrby(METRICS_PREFIX .. item[1], item[2])
+            end
+            ctx_red:commit_pipeline()
+        end)
+    end
+
+    ngx.say(encoded)
+    return _finish(status)
 end
 
 local function iso8601_timestamp()
@@ -422,25 +625,27 @@ local function lazy_recalc_total_size(red)
         return get_total_size(red)
     end
 
-    local keys = scan_keys(red, PREFIX .. "*")
+    local members = zscan_members(red, INDEX_KEY)
     local sum = 0
-    if keys and #keys > 0 then
-        local vals, err = mget_chunked(red, keys)
+    if members and #members > 0 then
+        local redis_keys = {}
+        for i, k in ipairs(members) do
+            redis_keys[i] = PREFIX .. k
+        end
+        local vals, err = mget_chunked(red, redis_keys)
         if vals then
             for i, val in ipairs(vals) do
-                local key_name = keys[i]
-                if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
-                    and not string.match(key_name, "^" .. CALLBACK_PREFIX)
-                    and not string.match(key_name, "^" .. METRICS_PREFIX)
-                    and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
-                    if val and val ~= ngx.null then
-                        local ok, d = pcall(cjson.decode, val)
-                        if ok and type(d) == "table" and d.size then
-                            sum = sum + d.size
-                        else
-                            sum = sum + #val
-                        end
+                local webhook_key = members[i]
+                if val and val ~= ngx.null then
+                    local ok, d = pcall(cjson.decode, val)
+                    if ok and type(d) == "table" and d.size then
+                        sum = sum + d.size
+                    else
+                        sum = sum + #val
                     end
+                else
+                    -- Stale index entry (expired/deleted)
+                    _index_remove(red, nil, webhook_key)
                 end
             end
         end
@@ -452,43 +657,39 @@ end
 
 local function get_stats(red)
     local total_size = lazy_recalc_total_size(red)
-    local keys = scan_keys(red, PREFIX .. "*")
 
-    local count = 0
+    local count = tonumber(red:zcard(INDEX_KEY)) or 0
     local categories = {}
-    local oldest_key = nil
-    local newest_key = nil
-    local oldest_time = nil
-    local newest_time = nil
-
-    if keys and #keys > 0 then
-        for _, key_name in ipairs(keys) do
-            if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
-                and not string.match(key_name, "^" .. CALLBACK_PREFIX)
-                and not string.match(key_name, "^" .. METRICS_PREFIX)
-                and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
-                count = count + 1
-
-                -- Extract category from key
-                local cat = string.match(key_name, "^" .. PREFIX .. "([^:]+)")
-                if cat then
-                    categories[cat] = (categories[cat] or 0) + 1
+    do
+        local raw = red:hgetall(CATEGORY_COUNT_KEY)
+        if raw and type(raw) == "table" then
+            local i = 1
+            while i <= #raw do
+                local k = raw[i]
+                local v = tonumber(raw[i + 1]) or 0
+                if v > 0 then
+                    categories[k] = v
                 end
-
-                -- Extract timestamp from key
-                local timestamp = string.match(key_name, ":(%d+):")
-                if timestamp then
-                    local ts = tonumber(timestamp)
-                    if not oldest_time or ts < oldest_time then
-                        oldest_time = ts
-                        oldest_key = string.gsub(key_name, "^" .. PREFIX, "")
-                    end
-                    if not newest_time or ts > newest_time then
-                        newest_time = ts
-                        newest_key = string.gsub(key_name, "^" .. PREFIX, "")
-                    end
-                end
+                i = i + 2
             end
+        end
+    end
+
+    local oldest_key
+    local newest_key
+    local oldest_time
+    local newest_time
+
+    do
+        local newest = red:zrevrange(INDEX_KEY, 0, 0)
+        if newest and newest[1] then
+            newest_key = newest[1]
+            newest_time = _parse_key_timestamp(newest_key)
+        end
+        local oldest = red:zrange(INDEX_KEY, 0, 0)
+        if oldest and oldest[1] then
+            oldest_key = oldest[1]
+            oldest_time = _parse_key_timestamp(oldest_key)
         end
     end
 
@@ -522,8 +723,11 @@ local function search_webhooks(red, query)
         local key_name = keys[i]
         if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
             and not string.match(key_name, "^" .. CALLBACK_PREFIX)
+            and not string.match(key_name, "^" .. CALLBACK_PREFIX_FALLBACK)
             and not string.match(key_name, "^" .. METRICS_PREFIX)
-            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
+            and not string.match(key_name, "^" .. METRICS_PREFIX_FALLBACK)
+            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX)
+            and not string.match(key_name, "^" .. WEBSOCKET_PREFIX_FALLBACK) then
             if val and val ~= ngx.null then
                 local ok, decoded = pcall(cjson.decode, val)
                 if ok and type(decoded) == "table" then
@@ -548,19 +752,27 @@ end
 
 local function get_prometheus_metrics(red)
     local metrics = {}
-    local metric_keys = scan_keys(red, METRICS_PREFIX .. "*")
 
-    if metric_keys and #metric_keys > 0 then
-        local values, err = mget_chunked(red, metric_keys)
-        if values then
-            for i, key in ipairs(metric_keys) do
-                local metric_name = string.gsub(key, "^" .. METRICS_PREFIX, "")
-                local value = values[i]
-                if value and value ~= ngx.null then
-                    metrics[metric_name] = tonumber(value) or 0
+    -- Load metrics keys.
+    local function _load(prefix)
+        local metric_keys = scan_keys(red, prefix .. "*")
+        if metric_keys and #metric_keys > 0 then
+            local values, err = mget_chunked(red, metric_keys)
+            if values then
+                for i, key in ipairs(metric_keys) do
+                    local metric_name = string.gsub(key, "^" .. prefix, "")
+                    local value = values[i]
+                    if value and value ~= ngx.null then
+                        metrics[metric_name] = (metrics[metric_name] or 0) + (tonumber(value) or 0)
+                    end
                 end
             end
         end
+    end
+
+    _load(METRICS_PREFIX)
+    if METRICS_PREFIX_FALLBACK ~= METRICS_PREFIX then
+        _load(METRICS_PREFIX_FALLBACK)
     end
 
     -- Get current stats
@@ -606,6 +818,38 @@ local function get_prometheus_metrics(red)
     table.insert(output, string.format("webhook_errors_total %d", metrics.errors_total or 0))
 
     table.insert(output, "")
+    table.insert(output, "# HELP webhook_rate_limited_total Total number of rate-limited requests")
+    table.insert(output, "# TYPE webhook_rate_limited_total counter")
+    table.insert(output, string.format("webhook_rate_limited_total %d", metrics.rate_limited_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_bytes_in_total Total request bytes received")
+    table.insert(output, "# TYPE webhook_bytes_in_total counter")
+    table.insert(output, string.format("webhook_bytes_in_total %d", metrics.bytes_in_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_bytes_out_total Total response bytes sent")
+    table.insert(output, "# TYPE webhook_bytes_out_total counter")
+    table.insert(output, string.format("webhook_bytes_out_total %d", metrics.bytes_out_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_responses_total Total responses")
+    table.insert(output, "# TYPE webhook_responses_total counter")
+    table.insert(output, string.format("webhook_responses_total %d", metrics.responses_total or 0))
+
+    table.insert(output, "")
+    table.insert(output, "# HELP webhook_request_latency_ms Request latency histogram in milliseconds")
+    table.insert(output, "# TYPE webhook_request_latency_ms histogram")
+    local buckets = { 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 }
+    for _, le in ipairs(buckets) do
+        local v = metrics["latency_ms_bucket_le_" .. tostring(le)] or 0
+        table.insert(output, string.format("webhook_request_latency_ms_bucket{le=\"%d\"} %d", le, v))
+    end
+    table.insert(output, string.format("webhook_request_latency_ms_bucket{le=\"+Inf\"} %d", metrics.latency_ms_bucket_le_inf or 0))
+    table.insert(output, string.format("webhook_request_latency_ms_sum %d", metrics.latency_ms_sum or 0))
+    table.insert(output, string.format("webhook_request_latency_ms_count %d", metrics.latency_ms_count or 0))
+
+    table.insert(output, "")
     table.insert(output, "# HELP webhook_auth_missing_total Requests missing an API key")
     table.insert(output, "# TYPE webhook_auth_missing_total counter")
     table.insert(output, string.format("webhook_auth_missing_total %d", metrics.auth_missing_total or 0))
@@ -644,8 +888,8 @@ local function get_prometheus_metrics(red)
 end
 
 local function export_webhooks(red, category_filter)
-    local pattern = category_filter and (PREFIX .. category_filter .. ":*") or (PREFIX .. "*")
-    local keys = scan_keys(red, pattern)
+    local zkey = category_filter and _index_key_for_category(category_filter) or INDEX_KEY
+    local members = zscan_members(red, zkey)
     local export_data = {
         version = "1.0",
         exported_at = iso8601_timestamp(),
@@ -653,57 +897,33 @@ local function export_webhooks(red, category_filter)
         webhooks = {}
     }
 
-    if not keys or #keys == 0 then
+    if not members or #members == 0 then
         return export_data
     end
 
-    local vals = mget_chunked(red, keys)
+    local redis_keys = {}
+    for i, k in ipairs(members) do
+        redis_keys[i] = PREFIX .. k
+    end
+    local vals = mget_chunked(red, redis_keys)
     if vals then
-        local callback_keys = {}
-        local callback_index = {}
-
         for i, val in ipairs(vals) do
-            local key_name = keys[i]
-            if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY
-               and not string.match(key_name, "^" .. CALLBACK_PREFIX)
-               and not string.match(key_name, "^" .. METRICS_PREFIX)
-               and not string.match(key_name, "^" .. WEBSOCKET_PREFIX) then
-
-                if val and val ~= ngx.null then
-                    local ok, decoded = pcall(cjson.decode, val)
-                    if ok and type(decoded) == "table" then
-                        local webhook_key = string.gsub(key_name, "^" .. PREFIX, "")
-                        local ttl = red:ttl(key_name) or -1
-
-                        local callback_key = CALLBACK_PREFIX .. webhook_key
-                        callback_index[webhook_key] = #callback_keys + 1
-                        callback_keys[#callback_keys + 1] = callback_key
-
-                        table.insert(export_data.webhooks, {
-                            key = webhook_key,
-                            ttl = ttl,
-                            created_at = decoded.created_at,
-                            category = decoded.category,
-                            payload = decoded.payload,
-                            callback_url = nil
-                        })
-                    end
+            local webhook_key = members[i]
+            if val and val ~= ngx.null then
+                local ok, decoded = pcall(cjson.decode, val)
+                if ok and type(decoded) == "table" then
+                    local ttl = red:ttl(PREFIX .. webhook_key) or -1
+                    table.insert(export_data.webhooks, {
+                        key = webhook_key,
+                        ttl = ttl,
+                        created_at = decoded.created_at,
+                        category = decoded.category,
+                        payload = decoded.payload,
+                        callback_url = _get_callback_url(red, webhook_key)
+                    })
                 end
-            end
-        end
-
-        if #callback_keys > 0 then
-            local callback_vals = mget_chunked(red, callback_keys)
-            if callback_vals then
-                for _, item in ipairs(export_data.webhooks) do
-                    local idx = callback_index[item.key]
-                    if idx then
-                        local v = callback_vals[idx]
-                        if v and v ~= ngx.null then
-                            item.callback_url = v
-                        end
-                    end
-                end
+            else
+                _index_remove(red, nil, webhook_key)
             end
         end
     end
@@ -724,45 +944,60 @@ local function import_webhooks(red, import_data)
         total_failed = 0
     }
 
+    local current_total = lazy_recalc_total_size(red)
+
     for idx, webhook in ipairs(import_data.webhooks) do
         if type(webhook) == "table" and webhook.payload and webhook.category then
             local payload_json = cjson.encode(webhook.payload)
             local ttl = tonumber(webhook.ttl) or DEFAULT_TTL
             if ttl <= 0 then ttl = DEFAULT_TTL end
 
-            local created_at = webhook.created_at or iso8601_timestamp()
-            local key = PREFIX .. webhook.category .. ":" .. ngx.time() .. ":" .. idx .. ":" .. ngx.md5(payload_json)
-
-            local store_data = {
-                created_at = created_at,
-                category = webhook.category,
-                payload = webhook.payload,
-                size = #payload_json
-            }
-
-            local ok, err = red:set(key, cjson.encode(store_data), "EX", ttl)
-            if ok then
-                update_total_size(red, #payload_json)
-
-                -- Restore callback URL if present
-                if webhook.callback_url then
-                    local callback_key = CALLBACK_PREFIX .. string.gsub(key, "^" .. PREFIX, "")
-                    red:set(callback_key, webhook.callback_url, "EX", ttl)
-                end
-
-                table.insert(results.imported, {
-                    index = idx,
-                    key = string.gsub(key, "^" .. PREFIX, ""),
-                    category = webhook.category
-                })
-                results.total_imported = results.total_imported + 1
-            else
+            if current_total + #payload_json > TOTAL_PAYLOAD_LIMIT then
                 table.insert(results.failed, {
                     index = idx,
-                    error = "Failed to import",
-                    details = err
+                    error = "Storage limit reached",
+                    error_code = "STORAGE_LIMIT_EXCEEDED"
                 })
                 results.total_failed = results.total_failed + 1
+            else
+
+                local created_at = webhook.created_at or iso8601_timestamp()
+                local key = PREFIX .. webhook.category .. ":" .. ngx.time() .. ":" .. idx .. ":" .. ngx.md5(payload_json)
+
+                local store_data = {
+                    created_at = created_at,
+                    category = webhook.category,
+                    payload = webhook.payload,
+                    size = #payload_json
+                }
+
+                local ok, err = red:set(key, cjson.encode(store_data), "EX", ttl)
+                if ok then
+                    update_total_size(red, #payload_json)
+                    current_total = current_total + #payload_json
+
+                    local webhook_key = string.gsub(key, "^" .. PREFIX, "")
+                    _index_add(red, webhook.category, webhook_key)
+
+                    -- Restore callback URL if present
+                    if webhook.callback_url then
+                        _set_callback_url(red, webhook_key, webhook.callback_url, ttl)
+                    end
+
+                    table.insert(results.imported, {
+                        index = idx,
+                        key = webhook_key,
+                        category = webhook.category
+                    })
+                    results.total_imported = results.total_imported + 1
+                else
+                    table.insert(results.failed, {
+                        index = idx,
+                        error = "Failed to import",
+                        details = err
+                    })
+                    results.total_failed = results.total_failed + 1
+                end
             end
         else
             table.insert(results.failed, {
@@ -787,9 +1022,427 @@ local function publish_websocket_event(red, event_type, data)
     red:publish("webhook:events", cjson.encode(event))
 end
 
+local function _validate_category(category)
+    if not category or category == "" then
+        return false, "Category is required"
+    end
+    if category:sub(1, 1) == "_" then
+        return false, "Categories starting with '_' are reserved"
+    end
+    if #category > 64 then
+        return false, "Category too long"
+    end
+    if not category:match("^[A-Za-z0-9][A-Za-z0-9_%-%.,]*$") then
+        return false, "Invalid category format"
+    end
+    return true
+end
+
+local function _validate_key(key)
+    if not key or key == "" then
+        return false, "Key is required"
+    end
+    if #key > 512 then
+        return false, "Key too long"
+    end
+    if key:find("/") then
+        return false, "Key must not contain '/'"
+    end
+    if key:match("[%c%s]") then
+        return false, "Key must not contain whitespace/control characters"
+    end
+    return true
+end
+
+local function _key_matches_category(category, key)
+    if not category or not key then
+        return false
+    end
+    return key:sub(1, #category + 1) == (category .. ":")
+end
+
+_parse_key_timestamp = function(key)
+    if type(key) ~= "string" then
+        return nil
+    end
+    local ts = key:match(":(%d+):")
+    if ts then
+        return tonumber(ts)
+    end
+    return nil
+end
+
+_get_callback_url = function(red, webhook_key)
+    local k_new = CALLBACK_PREFIX .. webhook_key
+    local v = red:get(k_new)
+    if v and v ~= ngx.null then
+        return v
+    end
+
+    local k_old = CALLBACK_PREFIX_FALLBACK .. webhook_key
+    if k_old ~= k_new then
+        local v_old = red:get(k_old)
+        if v_old and v_old ~= ngx.null then
+            return v_old
+        end
+    end
+    return nil
+end
+
+_del_callback_url = function(red, webhook_key)
+    local k_new = CALLBACK_PREFIX .. webhook_key
+    red:del(k_new)
+
+    local k_old = CALLBACK_PREFIX_FALLBACK .. webhook_key
+    if k_old ~= k_new then
+        red:del(k_old)
+    end
+end
+
+_set_callback_url = function(red, webhook_key, callback_url, ttl)
+    local k_new = CALLBACK_PREFIX .. webhook_key
+    red:set(k_new, callback_url, "EX", ttl)
+end
+
+_index_key_for_category = function(category)
+    return INDEX_CAT_PREFIX .. category
+end
+
+_index_add = function(red, category, webhook_key, score)
+    if not score then
+        local ts = _parse_key_timestamp(webhook_key) or ngx.time()
+        local crc = 0
+        if ngx and ngx.crc32_short then
+            crc = ngx.crc32_short(webhook_key) or 0
+        end
+        -- Offset in [0, 1) so we never cross into the next second.
+        local offset = (crc % 1000000) / 1000000
+        score = (ts or ngx.time()) + offset
+    end
+    red:zadd(INDEX_KEY, score, webhook_key)
+    red:zadd(_index_key_for_category(category), score, webhook_key)
+    red:hincrby(CATEGORY_COUNT_KEY, category, 1)
+end
+
+_index_remove = function(red, category, webhook_key)
+    red:zrem(INDEX_KEY, webhook_key)
+    if category and category ~= "" then
+        red:zrem(_index_key_for_category(category), webhook_key)
+        red:hincrby(CATEGORY_COUNT_KEY, category, -1)
+    else
+        -- Best-effort removal when category is unknown: derive from key prefix.
+        local cat = webhook_key:match("^([^:]+):")
+        if cat then
+            red:zrem(_index_key_for_category(cat), webhook_key)
+            red:hincrby(CATEGORY_COUNT_KEY, cat, -1)
+        end
+    end
+end
+
+local function _zrevrangebyscore_withscores(red, zkey, max_score, min_score, limit)
+    local function _score_arg(v, d)
+        if v == nil then
+            return d
+        end
+        if type(v) == "string" then
+            return v
+        end
+        return tostring(v)
+    end
+
+    local maxv = _score_arg(max_score, "+inf")
+    local minv = _score_arg(min_score, "-inf")
+    local res, err = red:zrevrangebyscore(zkey, maxv, minv, "WITHSCORES", "LIMIT", 0, limit)
+    if not res then
+        return nil, err
+    end
+    return res
+end
+
+local function _decode_index_withscores(res)
+    local out = {}
+    local i = 1
+    while i <= #res do
+        local member = res[i]
+        local score = tonumber(res[i + 1])
+        out[#out + 1] = { member = member, score = score }
+        i = i + 2
+    end
+    return out
+end
+
+local function _load_webhook_objects(red, webhook_keys, include_payload)
+    if not webhook_keys or #webhook_keys == 0 then
+        return {}
+    end
+
+    local redis_keys = {}
+    for i, k in ipairs(webhook_keys) do
+        redis_keys[i] = PREFIX .. k
+    end
+
+    local vals, err = mget_chunked(red, redis_keys)
+    local ttls, terr = ttl_pipeline_chunked(red, redis_keys)
+
+    local out = {}
+    if not vals then
+        return out
+    end
+
+    for i, val in ipairs(vals) do
+        local webhook_key = webhook_keys[i]
+        if val and val ~= ngx.null then
+            local decoded
+            local ok, d = pcall(cjson.decode, val)
+            if ok and type(d) == "table" then
+                decoded = d
+            end
+            local ttl = -1
+            if ttls and ttls[i] ~= nil then
+                ttl = tonumber(ttls[i]) or -1
+            end
+            local item = {
+                key = webhook_key,
+                ttl = ttl,
+                created_at = decoded and decoded.created_at or nil,
+                category = decoded and decoded.category or (webhook_key:match("^([^:]+):") or nil),
+            }
+            if include_payload then
+                item.payload = decoded and decoded.payload or nil
+            end
+            out[#out + 1] = item
+        else
+            -- Stale index entry (expired/deleted). Remove lazily.
+            _index_remove(red, nil, webhook_key)
+        end
+    end
+
+    return out
+end
+
+local function _ensure_indexes(red)
+    local ready_key = PREFIX .. "_index_ready"
+    local ready = red:get(ready_key)
+    if ready and ready ~= ngx.null and tostring(ready) == "1" then
+        return
+    end
+
+    local lock_key = ready_key .. ":rebuild_lock"
+
+    -- Ensure only one worker performs a rebuild at a time.
+    local lock_ok = red:set(lock_key, "1", "NX", "EX", 120)
+    if not lock_ok or lock_ok == ngx.null then
+        -- Another worker is rebuilding; wait briefly for readiness.
+        for _ = 1, 50 do
+            ngx.sleep(0.05)
+            local r = red:get(ready_key)
+            if r and r ~= ngx.null and tostring(r) == "1" then
+                return
+            end
+        end
+        return
+    end
+
+    -- Re-check now that we hold the lock.
+    ready = red:get(ready_key)
+    if ready and ready ~= ngx.null and tostring(ready) == "1" then
+        pcall(function()
+            red:del(lock_key)
+        end)
+        return
+    end
+
+    -- If indexes already have content, consider them ready.
+    local n = red:zcard(INDEX_KEY)
+    if n and tonumber(n) and tonumber(n) > 0 then
+        red:set(ready_key, "1")
+        pcall(function()
+            red:del(lock_key)
+        end)
+        return
+    end
+
+    -- Rebuild from existing webhook keys.
+    local keys = scan_keys(red, PREFIX .. "*")
+    if not keys or #keys == 0 then
+        red:set(ready_key, "1")
+        pcall(function()
+            red:del(lock_key)
+        end)
+        return
+    end
+
+    -- Reset counts/indexes (best-effort) to avoid double counting.
+    pcall(function()
+        red:del(INDEX_KEY)
+        red:del(CATEGORY_COUNT_KEY)
+    end)
+
+    -- Clear per-category index keys.
+    pcall(function()
+        local idx_keys = scan_keys(red, INDEX_CAT_PREFIX .. "*")
+        if idx_keys and #idx_keys > 0 then
+            red:del(unpack(idx_keys))
+        end
+    end)
+
+    for _, redis_key in ipairs(keys) do
+        if redis_key ~= TOTAL_SIZE_KEY
+            and redis_key ~= LAST_RECALC_KEY
+            and redis_key ~= INDEX_KEY
+            and redis_key ~= CATEGORY_COUNT_KEY
+            and not string.match(redis_key, "^" .. INDEX_CAT_PREFIX)
+            and not string.match(redis_key, "^" .. CALLBACK_PREFIX)
+            and not string.match(redis_key, "^" .. CALLBACK_PREFIX_FALLBACK)
+            and not string.match(redis_key, "^" .. METRICS_PREFIX)
+            and not string.match(redis_key, "^" .. METRICS_PREFIX_FALLBACK)
+            and not string.match(redis_key, "^" .. WEBSOCKET_PREFIX)
+            and not string.match(redis_key, "^" .. WEBSOCKET_PREFIX_FALLBACK)
+            and not string.match(redis_key, "^" .. RATE_LIMIT_PREFIX) then
+
+            local webhook_key = string.gsub(redis_key, "^" .. PREFIX, "")
+            local category = webhook_key:match("^([^:]+):")
+            if category then
+                local ts = _parse_key_timestamp(webhook_key) or ngx.time()
+                local crc = 0
+                if ngx and ngx.crc32_short then
+                    crc = ngx.crc32_short(webhook_key) or 0
+                end
+                local offset = (crc % 1000000) / 1000000
+                local score = ts + offset
+                _index_add(red, category, webhook_key, score)
+            end
+        end
+    end
+
+    red:set(ready_key, "1")
+    pcall(function()
+        red:del(lock_key)
+    end)
+end
+
+local function _rate_limit_key_for(identifier)
+    local window_start = math.floor(ngx.time() / RATE_LIMIT_WINDOW_S) * RATE_LIMIT_WINDOW_S
+    return RATE_LIMIT_PREFIX .. identifier .. ":" .. tostring(window_start)
+end
+
+local function _enforce_rate_limit(red, identifier)
+    local k = _rate_limit_key_for(identifier)
+    local n, err = red:incr(k)
+    if not n then
+        -- If rate limiting is misbehaving, fail open.
+        increment_metric(red, "rate_limit_errors_total")
+        return true
+    end
+    if n == 1 then
+        red:expire(k, RATE_LIMIT_WINDOW_S + 1)
+    end
+    if n > RATE_LIMIT_MAX_REQUESTS then
+        increment_metric(red, "rate_limited_total")
+        return false, n
+    end
+    return true, n
+end
+
+local function _is_private_ip_literal(host)
+    if not host or host == "" then
+        return false
+    end
+    local h = host
+    -- Strip port.
+    h = h:gsub(":%d+$", "")
+    if h == "localhost" then
+        return true
+    end
+    if h:match("^%d+%.%d+%.%d+%.%d+$") then
+        local a, b, c, d = h:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+        a = tonumber(a)
+        b = tonumber(b)
+        if not a or not b then
+            return false
+        end
+        if a == 0 then
+            return true
+        end
+        if a == 10 then
+            return true
+        end
+        if a == 127 then
+            return true
+        end
+        if a == 192 and b == 168 then
+            return true
+        end
+        if a == 172 and b >= 16 and b <= 31 then
+            return true
+        end
+        if a == 169 and b == 254 then
+            return true
+        end
+        return false
+    end
+    -- Bracketed IPv6 literal.
+    if h:match("^%[.+%]$") then
+        -- Block all IPv6 literals by default (conservative).
+        return true
+    end
+    -- Hostname.
+    return false
+end
+
+_validate_callback_url = function(url)
+    if url == nil then
+        return true
+    end
+    if type(url) ~= "string" then
+        return false, "callback_url must be a string"
+    end
+    if url == "" then
+        return true
+    end
+    if #url > CALLBACK_URL_MAX_LEN then
+        return false, "callback_url too long"
+    end
+
+    local m = ngx.re.match(url, [[^(https?)://([^/]+)(/.*)?$]], "jo")
+    if not m then
+        return false, "callback_url must be an absolute http(s) URL"
+    end
+    local scheme = (m[1] or ""):lower()
+    local hostport = (m[2] or "")
+    if scheme == "http" and not CALLBACK_URL_ALLOW_HTTP then
+        return false, "callback_url http scheme is not allowed"
+    end
+
+    local host = hostport:lower()
+    -- Remove any userinfo
+    host = host:gsub("^.-@", "")
+
+    if next(CALLBACK_URL_ALLOWLIST_STATE) ~= nil then
+        -- allowlist matches on host (including optional port).
+        if not CALLBACK_URL_ALLOWLIST_STATE[host] then
+            -- Try without port.
+            local bare = host:gsub(":%d+$", "")
+            if not CALLBACK_URL_ALLOWLIST_STATE[bare] then
+                return false, "callback_url host is not in allowlist"
+            end
+        end
+    end
+
+    if CALLBACK_URL_BLOCK_PRIVATE_IPS and _is_private_ip_literal(host) then
+        return false, "callback_url host is not allowed"
+    end
+
+    return true
+end
+
 -- ==== MAIN LOGIC ====
 local method = ngx.req.get_method()
 local args = ngx.req.get_uri_args()
+
+if ngx.ctx then
+    ngx.ctx.request_start = ngx.now()
+end
 
 -- Parse REST-style path: /webhook/category or /webhook/category/key
 local uri = ngx.var.uri
@@ -806,27 +1459,60 @@ if path_parts[2] and path_parts[2] ~= "" then
 end
 local key_from_path = path_parts[3]
 
+-- Handle CORS preflight early (no Redis needed).
+if method == "OPTIONS" then
+    _apply_cors_headers()
+    ngx.status = 204
+    return _finish(204)
+end
+
 -- Connect to Redis
-local red = redis:new()
-red:set_timeout(1000)
-local ok, err = red:connect(REDIS_HOST, REDIS_PORT)
-if not ok then
+local red, err = redis_client.connect(CFG)
+if not red then
     return send_json(500, { error = "Failed to connect to Redis: " .. (err or "unknown") })
 end
 
 -- Make the Redis client available to helper functions (e.g., send_json) for
 -- centralized metrics accounting.
 ngx.ctx.red = red
+-- This is a no-op after the first successful rebuild.
+_ensure_indexes(red)
+
+-- Determine any presented API key once (also used for rate limiting).
+local presented_api_key = _get_presented_api_key()
+-- Browsers can't set custom headers on WebSocket connections.
+-- For GET /webhook/_ws, allow passing the key via query string.
+if (not presented_api_key or presented_api_key == "") and category == "_ws" then
+    presented_api_key = args.api_key or args.token
+end
+
+-- Optional rate limiting (fail-open if Redis errors).
+if RATE_LIMIT_ENABLED and not RATE_LIMIT_EXEMPT[category] then
+    local ident
+    if presented_api_key and presented_api_key ~= "" then
+        ident = "k:" .. ngx.md5(presented_api_key)
+    else
+        ident = "ip:" .. (ngx.var.remote_addr or "unknown")
+    end
+
+    local ok_rl, current = _enforce_rate_limit(red, ident)
+    if not ok_rl then
+        return send_json(429, {
+            error = "Rate limit exceeded",
+            error_code = "RATE_LIMITED",
+            window_seconds = RATE_LIMIT_WINDOW_S,
+            limit = RATE_LIMIT_MAX_REQUESTS,
+            current = current
+        }, {
+            ["Retry-After"] = tostring(RATE_LIMIT_WINDOW_S)
+        })
+    end
+end
 
 -- Enforce API-key auth if configured.
 -- Applies to all endpoints unless exempted via WEBHOOK_AUTH_EXEMPT.
 if AUTH_ENABLED and not AUTH_EXEMPT[category] then
-    local presented = _get_presented_api_key()
-    -- Browsers can't set custom headers on WebSocket connections.
-    -- For GET /webhook/_ws, allow passing the key via query string.
-    if (not presented or presented == "") and category == "_ws" then
-        presented = args.api_key or args.token
-    end
+    local presented = presented_api_key
     if not presented then
         increment_metric(red, "auth_missing_total")
         return send_json(401, {
@@ -881,6 +1567,18 @@ if method == "POST" then
 
     -- POST /webhook/:category/:key/_replay - replay a webhook
     if key_from_path and path_parts[4] == "_replay" then
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
+        local ok_key, key_err = _validate_key(key_from_path)
+        if not ok_key then
+            return send_json(400, { error = key_err, error_code = "INVALID_KEY" })
+        end
+        if not _key_matches_category(category, key_from_path) then
+            return send_json(400, { error = "Key does not match category", error_code = "KEY_CATEGORY_MISMATCH" })
+        end
+
         local full_key = PREFIX .. key_from_path
         local val = red:get(full_key)
         if not val or val == ngx.null then
@@ -906,6 +1604,12 @@ if method == "POST" then
         -- TTL from query params takes precedence, then body config, then default
         local new_ttl = tonumber(args.ttl) or replay_config.ttl or DEFAULT_TTL
         local new_category = args.category or replay_config.category or decoded.category
+        do
+            local ok_new_cat, new_cat_err = _validate_category(new_category)
+            if not ok_new_cat then
+                return send_json(400, { error = new_cat_err, error_code = "INVALID_CATEGORY" })
+            end
+        end
         local payload_json = cjson.encode(decoded.payload)
 
         local created_at = iso8601_timestamp()
@@ -933,6 +1637,8 @@ if method == "POST" then
 
         local generated_key = string.gsub(new_key, "^" .. PREFIX, "")
 
+        _index_add(red, new_category, generated_key)
+
         -- Publish WebSocket event
         publish_websocket_event(red, "webhook.replayed", {
             key = generated_key,
@@ -949,6 +1655,14 @@ if method == "POST" then
             ttl = new_ttl,
             url = ngx.var.scheme .. "://" .. ngx.var.host .. "/webhook/" .. new_category .. "/" .. generated_key
         })
+    end
+
+    -- Validate non-internal category for creation.
+    do
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
     end
 
     local body, err = read_request_body()
@@ -1014,9 +1728,12 @@ if method == "POST" then
                         update_total_size(red, #item_json)
                         current_total = current_total + #item_json
 
+                        local webhook_key = string.gsub(key, "^" .. PREFIX, "")
+                        _index_add(red, category, webhook_key)
+
                         table.insert(batch_results.success, {
                             index = idx,
-                            key = string.gsub(key, "^" .. PREFIX, ""),
+                            key = webhook_key,
                             created_at = created_at
                         })
                         batch_results.total_created = batch_results.total_created + 1
@@ -1050,6 +1767,13 @@ if method == "POST" then
     if ttl <= 0 then ttl = DEFAULT_TTL end
     -- Extract callback URL if provided (query param takes precedence)
     local callback_url = args.callback_url or payload.callback_url
+
+    if callback_url and type(callback_url) == "string" and callback_url ~= "" then
+        local ok_cb, cb_err = _validate_callback_url(callback_url)
+        if not ok_cb then
+            return send_json(400, { error = cb_err, error_code = "INVALID_CALLBACK_URL" })
+        end
+    end
     -- Remove ttl and callback_url from payload if present
     payload.ttl = nil
     payload.callback_url = nil
@@ -1085,13 +1809,13 @@ if method == "POST" then
 
     update_total_size(red, #body)
 
+    local generated_key = string.gsub(key, "^" .. PREFIX, "")  -- Remove prefix for URL
+    _index_add(red, category, generated_key)
+
     -- Store callback URL if provided
     if callback_url and type(callback_url) == "string" and callback_url ~= "" then
-        local callback_key = CALLBACK_PREFIX .. string.gsub(key, "^" .. PREFIX, "")
-        red:set(callback_key, callback_url, "EX", ttl)
+        _set_callback_url(red, generated_key, callback_url, ttl)
     end
-
-    local generated_key = string.gsub(key, "^" .. PREFIX, "")  -- Remove prefix for URL
     local total_size = get_total_size(red)
 
     -- Increment metrics
@@ -1150,14 +1874,20 @@ elseif method == "GET" then
         if not pok then
             increment_metric(red, "ws_backend_errors_total")
             wb:send_close()
-            return ngx.exit(200)
+            pcall(function()
+                _redis_put_back(pub)
+            end)
+            return _finish(200)
         end
 
         local sres, serr = pub:subscribe("webhook:events")
         if not sres then
             increment_metric(red, "ws_backend_errors_total")
             wb:send_close()
-            return ngx.exit(200)
+            pcall(function()
+                _redis_put_back(pub)
+            end)
+            return _finish(200)
         end
 
         increment_metric(red, "ws_connected_total")
@@ -1173,10 +1903,15 @@ elseif method == "GET" then
                 pub:unsubscribe("webhook:events")
             end)
             pcall(function()
-                pub:close()
+                _redis_put_back(pub)
             end)
             pcall(function()
                 wb:send_close()
+            end)
+
+            -- Return the main request Redis connection too.
+            pcall(function()
+                _redis_put_back(red)
             end)
         end
 
@@ -1217,9 +1952,10 @@ elseif method == "GET" then
 
     -- GET /webhook/_metrics - Prometheus metrics endpoint
     if category == "_metrics" then
+        _apply_cors_headers()
         ngx.header.content_type = "text/plain; version=0.0.4"
         ngx.say(get_prometheus_metrics(red))
-        return ngx.exit(200)
+        return _finish(200)
     end
 
     -- GET /webhook/_stats - return statistics
@@ -1258,18 +1994,131 @@ elseif method == "GET" then
             })
         end
 
-        local results = search_webhooks(red, query)
+        local limit = _parse_limit(args)
+        local cursor = _parse_cursor(args)
+        local include_payload = _parse_include_payload(args)
+
+        local max_bound
+        if cursor then
+            max_bound = "(" .. tostring(cursor)
+        else
+            max_bound = "+inf"
+        end
+        local scanned = 0
+        local next_cursor = nil
+        local results = {}
+        local last_match_score = nil
+
+        -- Iterate in batches until we have enough matches or hit the scan cap.
+        while #results < limit and scanned < SEARCH_MAX_CANDIDATES do
+            local raw, zerr = _zrevrangebyscore_withscores(red, INDEX_KEY, max_bound, "-inf", math.min(MAX_LIMIT, limit * 5))
+            if not raw then
+                return send_json(500, { error = "Search index read failed", error_code = "REDIS_ERROR", details = zerr })
+            end
+            local entries = _decode_index_withscores(raw)
+            if #entries == 0 then
+                next_cursor = nil
+                break
+            end
+
+            local candidate_keys = {}
+            local last_score = nil
+            local score_by_member = {}
+            for _, e in ipairs(entries) do
+                scanned = scanned + 1
+                last_score = e.score
+                candidate_keys[#candidate_keys + 1] = e.member
+                score_by_member[e.member] = e.score
+            end
+
+            -- Advance scan cursor for the next batch; actual pagination cursor is
+            -- derived from the last returned match (see below).
+            if last_score ~= nil then
+                max_bound = "(" .. tostring(last_score)
+            end
+
+            local redis_keys = {}
+            for i, k in ipairs(candidate_keys) do
+                redis_keys[i] = PREFIX .. k
+            end
+            local vals, merr = mget_chunked(red, redis_keys)
+            if vals then
+                for i, val in ipairs(vals) do
+                    local webhook_key = candidate_keys[i]
+                    if val and val ~= ngx.null then
+                        local ok, decoded = pcall(cjson.decode, val)
+                        if ok and type(decoded) == "table" then
+                            local payload_str = cjson.encode(decoded.payload or {})
+                            if string.find(string.lower(payload_str), string.lower(query), 1, true) then
+                                local item = {
+                                    key = webhook_key,
+                                    ttl = red:ttl(PREFIX .. webhook_key) or -1,
+                                    created_at = decoded.created_at,
+                                    category = decoded.category,
+                                }
+                                if include_payload then
+                                    item.payload = decoded.payload
+                                end
+                                results[#results + 1] = item
+                                last_match_score = score_by_member[webhook_key]
+                                if #results >= limit then
+                                    break
+                                end
+                            end
+                        end
+                    else
+                        _index_remove(red, nil, webhook_key)
+                    end
+                end
+            end
+
+            if #entries < math.min(MAX_LIMIT, limit * 5) then
+                break
+            end
+        end
+
+        -- Determine whether there are more candidates below the last returned match.
+        if last_match_score ~= nil then
+            local probe, _ = _zrevrangebyscore_withscores(red, INDEX_KEY, "(" .. tostring(last_match_score), "-inf", 1)
+            if probe and #probe > 0 then
+                next_cursor = last_match_score
+            else
+                next_cursor = nil
+            end
+        end
+
+        local headers = {
+            ["X-Search-Results"] = tostring(#results)
+        }
+        if next_cursor then
+            headers["X-Next-Cursor"] = tostring(next_cursor)
+        end
+
         return send_json(200, {
             query = query,
             count = #results,
-            results = results
-        }, {
-            ["X-Search-Results"] = tostring(#results)
-        })
+            results = results,
+            next_cursor = next_cursor
+        }, headers)
     end
 
     -- GET /webhook/:category/:key - retrieve specific key
     if key_from_path then
+        local ok_key, key_err = _validate_key(key_from_path)
+        if not ok_key then
+            return send_json(400, { error = key_err, error_code = "INVALID_KEY" })
+        end
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
+        if not _key_matches_category(category, key_from_path) then
+            return send_json(400, {
+                error = "Key does not match category",
+                error_code = "KEY_CATEGORY_MISMATCH"
+            })
+        end
+
         -- Construct full key with prefix
         local full_key = PREFIX .. key_from_path
         local val, gerr = red:get(full_key)
@@ -1280,11 +2129,7 @@ elseif method == "GET" then
         local decoded = cjson.decode(val)
 
         -- Check for callback URL
-        local callback_key = CALLBACK_PREFIX .. key_from_path
-        local callback_url = red:get(callback_key)
-        if callback_url == ngx.null then
-            callback_url = nil
-        end
+        local callback_url = _get_callback_url(red, key_from_path)
 
         return send_json(200, {
             key = key_from_path,
@@ -1296,75 +2141,99 @@ elseif method == "GET" then
         })
     else
         -- GET /webhook/:category - list all keys in category with optional filtering
-        local since = args.since and tonumber(args.since)
-
-        local pattern = PREFIX .. category .. ":*"
-        local keys = scan_keys(red, pattern)
-        if not keys or #keys == 0 then
-            return send_json(200, {
-                keys = {},
-                count = 0,
-                category = category
-            }, {
-                ["X-Total-Count"] = "0"
-            })
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
         end
 
-        -- Filter by timestamp if 'since' parameter provided
-        if since then
-            local filtered_keys = {}
-            for _, key_name in ipairs(keys) do
-                local timestamp = string.match(key_name, ":(%d+):")
-                if timestamp and tonumber(timestamp) >= since then
-                    table.insert(filtered_keys, key_name)
+        local since = args.since and tonumber(args.since)
+        local limit = _parse_limit(args)
+        local cursor = _parse_cursor(args)
+        local include_payload = _parse_include_payload(args)
+
+        local zkey = _index_key_for_category(category)
+        local max_bound
+        if cursor then
+            max_bound = "(" .. tostring(cursor)
+        else
+            max_bound = "+inf"
+        end
+
+        local collected = {}
+        local scanned = 0
+        local batch_size = math.min(MAX_LIMIT, limit * 3)
+        local next_cursor = nil
+
+        while #collected < limit and scanned < SEARCH_MAX_CANDIDATES do
+            local raw, zerr = _zrevrangebyscore_withscores(red, zkey, max_bound, "-inf", batch_size)
+            if not raw then
+                return send_json(500, { error = "Index read failed", error_code = "REDIS_ERROR", details = zerr })
+            end
+
+            local entries = _decode_index_withscores(raw)
+            if #entries == 0 then
+                next_cursor = nil
+                break
+            end
+
+            local keys = {}
+            local last_score = nil
+            for _, e in ipairs(entries) do
+                scanned = scanned + 1
+                last_score = e.score
+                local ts = since and _parse_key_timestamp(e.member) or nil
+                if (not since) or (ts and ts >= since) then
+                    keys[#keys + 1] = e.member
+                    if #keys >= limit then
+                        break
+                    end
                 end
             end
-            keys = filtered_keys
-        end
 
-        table.sort(keys, function(a, b) return a > b end) -- latest first
+            if last_score ~= nil then
+                max_bound = "(" .. tostring(last_score)
+                next_cursor = last_score
+            end
 
-        local list = {}
-        local vals, err = mget_chunked(red, keys)
-        local ttls, terr = ttl_pipeline_chunked(red, keys)
-        if vals then
-            for i, val in ipairs(vals) do
-                local key_name = keys[i]
-                if key_name ~= TOTAL_SIZE_KEY and key_name ~= LAST_RECALC_KEY then
-                    local decoded
-                    if val and val ~= ngx.null then
-                        local ok, d = pcall(cjson.decode, val)
-                        if ok and type(d) == "table" then
-                            decoded = d
-                        end
-                    end
-
-                    -- Always include payload in REST API response for category listing
-                    local ttl = -1
-                    if ttls and ttls[i] ~= nil then
-                        ttl = tonumber(ttls[i]) or -1
-                    end
-                    table.insert(list, {
-                        key = string.gsub(key_name, "^" .. PREFIX, ""),  -- Remove prefix
-                        ttl = ttl,
-                        created_at = decoded and decoded.created_at or nil,
-                        category = decoded and decoded.category or category,
-                        payload = decoded and decoded.payload or nil
-                    })
+            local objects = _load_webhook_objects(red, keys, include_payload)
+            for _, obj in ipairs(objects) do
+                if #collected >= limit then
+                    break
                 end
+                collected[#collected + 1] = obj
+            end
+
+            if #collected >= limit then
+                -- Determine whether there are more results beyond this cursor.
+                local probe, _ = _zrevrangebyscore_withscores(red, zkey, "(" .. tostring(next_cursor), "-inf", 1)
+                if not probe or #probe == 0 then
+                    next_cursor = nil
+                end
+                break
+            end
+
+            if #entries < batch_size then
+                next_cursor = nil
+                break
             end
         end
 
         local total_size = get_total_size(red)
-        return send_json(200, {
-            keys = list,
-            count = #list,
-            category = category
-        }, {
-            ["X-Total-Count"] = tostring(#list),
+        local headers = {
+            ["X-Total-Count"] = tostring(#collected),
             ["X-Storage-Used"] = tostring(total_size),
             ["X-Storage-Limit"] = tostring(TOTAL_PAYLOAD_LIMIT)
-        })
+        }
+        if next_cursor then
+            headers["X-Next-Cursor"] = tostring(next_cursor)
+        end
+
+        return send_json(200, {
+            keys = collected,
+            count = #collected,
+            category = category,
+            next_cursor = next_cursor
+        }, headers)
     end
 
 -- ===== PATCH =====
@@ -1377,6 +2246,20 @@ elseif method == "PATCH" then
             error = "Key required in path: /webhook/:category/:key",
             error_code = "MISSING_KEY"
         })
+    end
+
+    do
+        local ok_key, key_err = _validate_key(key_from_path)
+        if not ok_key then
+            return send_json(400, { error = key_err, error_code = "INVALID_KEY" })
+        end
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
+        if not _key_matches_category(category, key_from_path) then
+            return send_json(400, { error = "Key does not match category", error_code = "KEY_CATEGORY_MISMATCH" })
+        end
     end
 
     local body, err = read_request_body()
@@ -1416,26 +2299,33 @@ elseif method == "PATCH" then
             changes.ttl = new_ttl
 
             -- Also update callback TTL if exists
-            local callback_key = CALLBACK_PREFIX .. key_from_path
-            local callback_exists = red:exists(callback_key)
-            if callback_exists == 1 then
-                red:expire(callback_key, new_ttl)
+            local k_new = CALLBACK_PREFIX .. key_from_path
+            if red:exists(k_new) == 1 then
+                red:expire(k_new, new_ttl)
+            end
+
+            local k_old = CALLBACK_PREFIX_FALLBACK .. key_from_path
+            if k_old ~= k_new and red:exists(k_old) == 1 then
+                red:expire(k_old, new_ttl)
             end
         end
     end
 
     -- Update callback URL if provided
     if updates.callback_url ~= nil then
-        local callback_key = CALLBACK_PREFIX .. key_from_path
-        if updates.callback_url == "" or updates.callback_url == false then
+        if updates.callback_url == cjson.null or updates.callback_url == "" or updates.callback_url == false then
             -- Remove callback
-            red:del(callback_key)
+            _del_callback_url(red, key_from_path)
             changes.callback_url = nil
         else
             -- Set/update callback
+            local ok_cb, cb_err = _validate_callback_url(updates.callback_url)
+            if not ok_cb then
+                return send_json(400, { error = cb_err, error_code = "INVALID_CALLBACK_URL" })
+            end
             local current_ttl = red:ttl(full_key)
             if current_ttl and current_ttl > 0 then
-                red:set(callback_key, updates.callback_url, "EX", current_ttl)
+                _set_callback_url(red, key_from_path, updates.callback_url, current_ttl)
                 changes.callback_url = updates.callback_url
             end
         end
@@ -1462,6 +2352,11 @@ elseif method == "DELETE" then
     increment_metric(red, "requests_delete")
     -- DELETE /webhook/:category/_batch - batch delete
     if key_from_path == "_batch" then
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
+
         local body, err = read_request_body()
         if not body then
             return send_json(400, {
@@ -1488,24 +2383,33 @@ elseif method == "DELETE" then
         }
 
         for _, key_to_delete in ipairs(payload.keys) do
-            local full_key = PREFIX .. key_to_delete
-            local val = red:get(full_key)
-            if val and val ~= ngx.null then
-                local decoded = cjson.decode(val)
-                if decoded and decoded.size then
-                    update_total_size(red, -decoded.size)
-                else
-                    update_total_size(red, -#val)
-                end
-                -- Also delete callback if exists
-                local callback_key = CALLBACK_PREFIX .. key_to_delete
-                red:del(full_key, callback_key)
-
-                table.insert(batch_results.deleted, key_to_delete)
-                batch_results.total_deleted = batch_results.total_deleted + 1
-            else
+            local ok_key, key_err = _validate_key(key_to_delete)
+            if not ok_key then
                 table.insert(batch_results.not_found, key_to_delete)
                 batch_results.total_not_found = batch_results.total_not_found + 1
+            elseif not _key_matches_category(category, key_to_delete) then
+                table.insert(batch_results.not_found, key_to_delete)
+                batch_results.total_not_found = batch_results.total_not_found + 1
+            else
+                local full_key = PREFIX .. key_to_delete
+                local val = red:get(full_key)
+                if val and val ~= ngx.null then
+                    local decoded = cjson.decode(val)
+                    if decoded and decoded.size then
+                        update_total_size(red, -decoded.size)
+                    else
+                        update_total_size(red, -#val)
+                    end
+                    _index_remove(red, category, key_to_delete)
+                    _del_callback_url(red, key_to_delete)
+                    red:del(full_key)
+
+                    table.insert(batch_results.deleted, key_to_delete)
+                    batch_results.total_deleted = batch_results.total_deleted + 1
+                else
+                    table.insert(batch_results.not_found, key_to_delete)
+                    batch_results.total_not_found = batch_results.total_not_found + 1
+                end
             end
         end
 
@@ -1520,6 +2424,20 @@ elseif method == "DELETE" then
         })
     end
 
+    do
+        local ok_key, key_err = _validate_key(key_from_path)
+        if not ok_key then
+            return send_json(400, { error = key_err, error_code = "INVALID_KEY" })
+        end
+        local ok_cat, cat_err = _validate_category(category)
+        if not ok_cat then
+            return send_json(400, { error = cat_err, error_code = "INVALID_CATEGORY" })
+        end
+        if not _key_matches_category(category, key_from_path) then
+            return send_json(400, { error = "Key does not match category", error_code = "KEY_CATEGORY_MISMATCH" })
+        end
+    end
+
     local full_key = PREFIX .. key_from_path
     local val = red:get(full_key)
     if val and val ~= ngx.null then
@@ -1529,9 +2447,9 @@ elseif method == "DELETE" then
         else
             update_total_size(red, -#val)
         end
-        -- Also delete callback if exists
-        local callback_key = CALLBACK_PREFIX .. key_from_path
-        red:del(full_key, callback_key)
+        _index_remove(red, category, key_from_path)
+        _del_callback_url(red, key_from_path)
+        red:del(full_key)
 
         -- Increment metrics
         increment_metric(red, "deleted_total")

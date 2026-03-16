@@ -6,11 +6,11 @@ source = {
   tag = nil,
 }
 description = {
-  summary = "RESTful webhook storage service for OpenResty, backed by Valkey",
+  summary = "RESTful webhook storage service for OpenResty, backed by Valkey (or Redis)",
   detailed = [[
-A high-performance webhook storage service built with OpenResty/Nginx and Lua,
-backed by Valkey/Redis. Provides REST endpoints for storing, retrieving,
-searching, exporting, and managing TTL'd webhook payloads.
+A high-performance, RESTful webhook storage service built with OpenResty/Nginx and Lua,
+backed by Valkey (or Redis). Store, retrieve, and manage webhook payloads with
+advanced features like batch operations, search, and callback URL storage.
   ]],
   license = "MIT",
   homepage = "https://github.com/myrveln/lua-webhook",
@@ -26,5 +26,8 @@ build = {
   type = "builtin",
   modules = {
     webhook = "webhook.lua",
+    ["lua_webhook.settings"] = "lua_webhook/settings.lua",
+    ["lua_webhook.cors"] = "lua_webhook/cors.lua",
+    ["lua_webhook.redis_client"] = "lua_webhook/redis_client.lua",
   },
 }

@@ -12,30 +12,23 @@ The intended workflow is:
 - Docker + Docker Compose
 - Python 3
 
-## Start the Test Environment (Docker Compose)
+## Quick Start (Makefile)
 
-From the repository root:
+All local testing is driven via the Makefile in this directory.
 
-```bash
-docker compose up -d --build
-```
-
-Verify the service is responding (default is port 8080):
+From `./tests`:
 
 ```bash
-curl -fsS http://localhost:8080/webhook/_stats
-```
+# CI parity: runs no-auth, auth, and all opt-in modes
+make test all
 
-Note: the test suite includes a small startup wait (see `tests/conftest.py`) to reduce flakiness where `docker compose up -d` returns before OpenResty is accepting connections. You can tune the wait via:
-
-```bash
-export WEBHOOK_TEST_STARTUP_TIMEOUT_S=20
-```
-
-Stop the environment when done:
-
-```bash
-docker compose down
+# Run a single mode
+make test noauth
+make test auth
+make test cors
+make test rate_limit
+make test hash_auth
+make test callback_allowlist
 ```
 
 ## Python Environment Setup
@@ -50,57 +43,28 @@ Note: if `python` on your machine is not Python 3, use `python3` in the commands
 
 ### Setup Project Environment
 
-```bash
-cd tests
+The Makefile creates a local venv at `tests/.venv` automatically and installs `tests/requirements.txt`.
 
-# Create virtual environment
-python -m venv venv
+## Run Tests (manual / advanced)
 
-# Activate virtual environment
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-## Run Tests (Python venv)
-
-```bash
-cd tests
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Run tests against the Docker Compose environment
-BASE_URL=http://localhost:8080/webhook pytest -v \
-    test_webhook.py \
-    test_events.py \
-    test_ws.py
-
-# Deactivate when done
-deactivate
-```
+If you prefer manual control, the Makefile ultimately runs `docker compose up -d --build` from the repo root and invokes pytest from the venv.
 
 Notes:
 
 - `test_webhook.py`, `test_events.py`, and `test_ws.py` automatically include `X-API-Key` on all requests if you set `WEBHOOK_TEST_API_KEY`. This allows running the same functional suite against an auth-enabled deployment.
-- `test_events.py` consumes Valkey/Redis Pub/Sub on the `webhook:events` channel. With the default Compose stack, this is available on `localhost:6379`. If you run Valkey elsewhere, set `VALKEY_HOST`/`VALKEY_PORT` (or `REDIS_HOST`/`REDIS_PORT`).
+- `test_events.py` consumes Valkey/Redis Pub/Sub on the `webhook:events` channel. With the default Compose stack, this is available on `localhost:6379`. If you run Valkey elsewhere, set `WEBHOOK_REDIS_HOST`/`WEBHOOK_REDIS_PORT`.
 - `test_ws.py` validates the real WebSocket endpoint at `GET /webhook/_ws`, which streams the same events as the Pub/Sub channel.
 
 ## Run Tests With Authentication Enabled
 
 The service supports optional API key authentication (see the repo README). The test suite includes additional authentication tests in `test_auth.py`.
 
-### 1) Start Docker Compose with auth enabled
+### 1) Run auth mode
 
-From the repository root:
+From `./tests`:
 
 ```bash
-# Require an API key for all endpoints except _stats (so healthchecks still work)
-export WEBHOOK_API_KEYS="test-api-key"
-export WEBHOOK_AUTH_EXEMPT="_stats"
-
-docker compose up -d --build
+make test auth
 ```
 
 Quick checks:
@@ -115,18 +79,7 @@ curl -i -H "X-API-Key: definitely-wrong" http://localhost:8080/webhook
 curl -i -H "X-API-Key: test-api-key" http://localhost:8080/webhook
 ```
 
-### 2) Run the auth tests
-
-From the repository root (or any directory), with your venv available:
-
-```bash
-cd tests
-source venv/bin/activate
-
-BASE_URL=http://localhost:8080/webhook \
-WEBHOOK_TEST_API_KEY="test-api-key" \
-pytest -v test_auth.py
-```
+The Makefile starts Compose with `WEBHOOK_API_KEYS=test-api-key` and `WEBHOOK_AUTH_EXEMPT=_stats`, and runs the full integration suite with `WEBHOOK_TEST_API_KEY` set.
 
 ## Run Config Module Tests
 
@@ -134,39 +87,26 @@ The repository includes integration tests that validate loading settings from a 
 
 The default `docker-compose.yml` defines a second OpenResty instance (`openresty_config`) on port 8081 that mounts a test module from `tests/fixtures/webhook_config_test.lua`.
 
-Start the stack (this will bring up both `openresty` and `openresty_config`):
-
-```bash
-docker compose up -d --build
-```
-
-Then run the config tests:
-
-```bash
-cd tests
-source venv/bin/activate
-
-BASE_URL_CONFIG=http://localhost:8081/webhook \
-WEBHOOK_TEST_CONFIG_API_KEY="test-config-key" \
-pytest -v test_config.py
-```
+These are included in all Makefile modes that run the main suite (`noauth` and `auth`) and in `make test all`.
 
 ### Run the full suite (CI parity)
 
-This runs *all* tests, including config-module tests:
-
 ```bash
 cd tests
-source venv/bin/activate
-
-BASE_URL=http://localhost:8080/webhook \
-BASE_URL_CONFIG=http://localhost:8081/webhook \
-WEBHOOK_TEST_API_KEY="test-api-key" \
-WEBHOOK_TEST_CONFIG_API_KEY="test-config-key" \
-pytest -v
-
-deactivate
+make test all
 ```
+## Opt-in feature coverage (CI)
+
+Some features are enabled only via environment/module config at service startup (CORS, built-in rate limiting, hashed API keys, callback allowlists). These are covered in CI by running additional Compose passes with different env vars.
+
+Locally, the corresponding tests are skipped unless you set `WEBHOOK_TEST_OPTIN` to the scenario name *and* start the service with the matching config.
+
+Examples:
+
+- CORS: `make test cors`
+- Rate limiting: `make test rate_limit`
+- Hashed auth: `make test hash_auth`
+- Callback allowlist: `make test callback_allowlist`
 
 ### 3) Run the full integration suite with auth enabled (recommended)
 
@@ -174,7 +114,7 @@ With `WEBHOOK_TEST_API_KEY` set, the main integration tests will authenticate au
 
 ```bash
 cd tests
-source venv/bin/activate
+source .venv/bin/activate
 
 BASE_URL=http://localhost:8080/webhook \
 WEBHOOK_TEST_API_KEY="test-api-key" \
@@ -189,7 +129,7 @@ deactivate
 
 ### 4) Optional: run the same suite with auth disabled
 
-This is useful to ensure backwards compatibility for deployments that do not require an API key.
+This is useful to validate deployments that do not require an API key.
 
 ```bash
 cd ..
@@ -200,7 +140,7 @@ docker compose down
 WEBHOOK_API_KEYS= WEBHOOK_AUTH_EXEMPT= docker compose up -d --build
 
 cd tests
-source venv/bin/activate
+source .venv/bin/activate
 
 BASE_URL=http://localhost:8080/webhook pytest -v \
     test_webhook.py \
@@ -301,7 +241,7 @@ pytest test_webhook.py -n auto
 ```bash
 # Verify virtual environment is active (you should see (venv) in prompt)
 which python
-# Should show: .../tests/venv/bin/python
+# Should show: .../tests/.venv/bin/python
 
 # Verify correct Python version
 python --version
@@ -314,7 +254,7 @@ pip list
 
 ```bash
 # Activate environment
-source venv/bin/activate
+source .venv/bin/activate
 
 # Install new package
 pip install <package-name>
@@ -332,11 +272,11 @@ If your environment gets corrupted:
 deactivate
 
 # Remove old environment
-rm -rf venv
+rm -rf .venv
 
 # Create fresh environment
-python -m venv venv
-source venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 

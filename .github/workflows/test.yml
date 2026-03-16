@@ -7,6 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      WEBHOOK_TEST_API_KEY_HASH: ""
 
     steps:
     - uses: actions/checkout@v4
@@ -16,9 +17,6 @@ jobs:
       with:
         version: latest
 
-    - name: Start services
-      run: bash .github/scripts/compose_up.sh 60
-
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -27,45 +25,79 @@ jobs:
     - name: Install dependencies
       run: |
         cd tests
-        pip install -r requirements.txt
+        python3 -m venv .venv
+        .venv/bin/pip install -r requirements.txt
 
-    - name: Run tests
+    - name: Compute hashed API key (sha256)
+      run: |
+        python - <<'PY' >> "$GITHUB_ENV"
+        import hashlib
+        key = b"test-api-key"
+        print("WEBHOOK_TEST_API_KEY_HASH=" + hashlib.sha256(key).hexdigest())
+        PY
+
+    - name: Run tests (no-auth)
       env:
         BASE_URL: http://localhost:8080/webhook
         BASE_URL_CONFIG: http://localhost:8081/webhook
-        WEBHOOK_TEST_CONFIG_API_KEY: test-config-key
+        TEST_CONFIG_API_KEY: test-config-key
+        PYTEST_ARGS: "--cov=. --cov-report="
       run: |
         cd tests
-        # First pass (no-auth). Write coverage data, but defer XML generation
-        # until after the auth-enabled pass so we can merge results.
-        pytest test_webhook.py test_events.py test_ws.py test_config.py -v --cov=. --cov-report=
+        make test noauth
 
-    - name: Stop services (no-auth)
-      if: always()
-      run: docker compose down
-
-    - name: Start services (auth enabled)
-      env:
-        WEBHOOK_API_KEYS: test-api-key
-        WEBHOOK_AUTH_EXEMPT: _stats
-      run: bash .github/scripts/compose_up.sh 60
-
-    - name: Run auth tests
+    - name: Run tests (auth enabled)
       env:
         BASE_URL: http://localhost:8080/webhook
         BASE_URL_CONFIG: http://localhost:8081/webhook
-        WEBHOOK_TEST_API_KEY: test-api-key
-        WEBHOOK_TEST_CONFIG_API_KEY: test-config-key
+        TEST_API_KEY: test-api-key
+        TEST_CONFIG_API_KEY: test-config-key
+        PYTEST_ARGS: "--cov=. --cov-append --cov-report="
       run: |
         cd tests
-        # Second pass (auth enabled). Append to existing coverage data.
-        pytest test_webhook.py test_events.py test_ws.py test_auth.py test_config.py -v --cov=. --cov-append --cov-report=
+        make test auth
+
+    - name: Run tests (CORS)
+      env:
+        BASE_URL: http://localhost:8080/webhook
+        TEST_API_KEY: test-api-key
+        PYTEST_ARGS: "--cov=. --cov-append --cov-report="
+      run: |
+        cd tests
+        make test cors
+
+    - name: Run tests (rate limiting)
+      env:
+        BASE_URL: http://localhost:8080/webhook
+        TEST_API_KEY: test-api-key
+        PYTEST_ARGS: "--cov=. --cov-append --cov-report="
+      run: |
+        cd tests
+        make test rate_limit
+
+    - name: Run tests (hashed auth)
+      env:
+        BASE_URL: http://localhost:8080/webhook
+        TEST_API_KEY: test-api-key
+        PYTEST_ARGS: "--cov=. --cov-append --cov-report="
+      run: |
+        cd tests
+        make test hash_auth
+
+    - name: Run tests (callback allowlist)
+      env:
+        BASE_URL: http://localhost:8080/webhook
+        TEST_API_KEY: test-api-key
+        PYTEST_ARGS: "--cov=. --cov-append --cov-report="
+      run: |
+        cd tests
+        make test callback_allowlist
 
     - name: Generate merged coverage.xml
       if: always()
       run: |
         cd tests
-        coverage xml -o coverage.xml
+        .venv/bin/python -m coverage xml -o coverage.xml
 
     - name: Coverage summary
       if: always()
